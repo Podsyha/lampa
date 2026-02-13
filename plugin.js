@@ -10,7 +10,8 @@
             const status = $(`
                 <div class="about" style="padding: 2rem;">
                     <h1 class="loading_title">TorrServer</h1>
-                    <p class="loading_status">Ищу последний запущенный файл...</p>
+                    <p class="loading_status">Подключаюсь к серверу...</p>
+                    <p class="loading_debug" style="font-size:0.8em; color:#aaa; margin-top:1rem;"></p>
                 </div>
             `);
             html.append(scroll.render());
@@ -19,61 +20,32 @@
         };
 
         this.start = function () {
-            const serverUrl = Lampa.Storage.get('torrserver_url') || Lampa.Storage.get('torrserver_url_two');
+            const self = this;
+            const serverUrl = (
+                Lampa.Storage.get('torrserver_url') ||
+                Lampa.Storage.get('torrserver_url_two') ||
+                ''
+            ).replace(/\/+$/, ''); // убираем trailing slash
+
             if (!serverUrl) return this.setError('Адрес TorrServer не настроен');
 
+            this.setDebug('Сервер: ' + serverUrl);
+            this.setStatus('Проверяю соединение...');
+
+            // Шаг 1: проверяем доступность через /echo
             network.native(
-                `${serverUrl}/torrents`,
-                (result) => {
-                    const list = Array.isArray(result) ? result : (result.torrents || []);
-                    if (!list.length) return this.setError('Список торрентов пуст');
-
-                    list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-                    const latest = list[0];
-
-                    // ИСПРАВЛЕНО: синтаксическая ошибка — была потеряна открывающая скобка
-                    html.find('.loading_status').text(`Запрашиваю плейлист: ${latest.title}`);
-
-                    const m3uUrl = `${serverUrl}/stream/${encodeURIComponent(latest.title)}.m3u?link=${latest.hash}&m3u&fromlast`;
-
-                    network.native(
-                        m3uUrl,
-                        (playlist) => {
-                            // ИСПРАВЛЕНО: ищем ссылку после строки #EXTINF, а не просто первую http-строку
-                            const lines = playlist.split('\n').map(str => str.trim());
-                            let streamUrl = null;
-                            for (let i = 0; i < lines.length; i++) {
-                                if (lines[i].startsWith('#EXTINF') && i + 1 < lines.length) {
-                                    const next = lines[i + 1];
-                                    if (next.startsWith('http')) {
-                                        streamUrl = next;
-                                        break;
-                                    }
-                                }
-                            }
-                            // Фолбэк: если структура #EXTINF не найдена — берём первую http-строку
-                            if (!streamUrl) {
-                                streamUrl = lines.find(line => line.startsWith('http'));
-                            }
-
-                            if (!streamUrl) return this.setError('Не удалось найти ссылку в плейлисте');
-
-                            // ИСПРАВЛЕНО: сначала запускаем плеер, потом уходим назад по стеку активностей
-                            Lampa.Player.play({
-                                url: streamUrl,
-                                title: latest.title,
-                                hash: latest.hash
-                            });
-                            Lampa.Activity.backward();
-                        },
-                        () => this.setError('Ошибка при получении плейлиста'),
-                        false,
-                        { dataType: 'text' }
-                    );
+                `${serverUrl}/echo`,
+                () => {
+                    self.setStatus('Получаю список торрентов...');
+                    self.fetchTorrentList(serverUrl);
                 },
-                () => this.setError('Ошибка связи с TorrServer'),
-                JSON.stringify({ action: 'list' }),
-                { dataType: 'json', contentType: 'application/json' }
+                () => {
+                    // /echo недоступен — пробуем сразу список
+                    self.setDebug('Сервер: ' + serverUrl + ' (echo недоступен, пробую напрямую)');
+                    self.fetchTorrentList(serverUrl);
+                },
+                false,
+                { dataType: 'text' }
             );
 
             Lampa.Controller.add('content', {
@@ -83,9 +55,108 @@
             Lampa.Controller.toggle('content');
         };
 
+        this.fetchTorrentList = function (serverUrl) {
+            const self = this;
+
+            // Шаг 2: POST /torrents с action:list (стандартный способ)
+            network.native(
+                `${serverUrl}/torrents`,
+                (result) => {
+                    const list = Array.isArray(result) ? result : (result.torrents || []);
+                    if (!list.length) return self.setError('Список торрентов пуст');
+                    self.playLatest(serverUrl, list);
+                },
+                () => {
+                    // POST не сработал — пробуем GET /torrents (старые версии TorrServer)
+                    self.setDebug('POST /torrents не сработал, пробую GET...');
+                    self.fetchTorrentListGet(serverUrl);
+                },
+                JSON.stringify({ action: 'list' }),
+                { dataType: 'json', contentType: 'application/json' }
+            );
+        };
+
+        this.fetchTorrentListGet = function (serverUrl) {
+            const self = this;
+
+            network.native(
+                `${serverUrl}/torrents`,
+                (result) => {
+                    const list = Array.isArray(result) ? result : (result.torrents || []);
+                    if (!list.length) return self.setError('Список торрентов пуст');
+                    self.playLatest(serverUrl, list);
+                },
+                () => {
+                    self.setError('Ошибка связи с TorrServer. Проверьте адрес сервера в настройках.');
+                    self.setDebug('Оба метода (POST и GET) не сработали');
+                },
+                false,
+                { dataType: 'json' }
+            );
+        };
+
+        this.playLatest = function (serverUrl, list) {
+            const self = this;
+
+            list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+            const latest = list[0];
+
+            this.setStatus(`Получаю плейлист: ${latest.title}`);
+            this.setDebug(`hash: ${latest.hash}`);
+
+            const m3uUrl = `${serverUrl}/stream/${encodeURIComponent(latest.title)}.m3u?link=${latest.hash}&m3u&fromlast`;
+
+            network.native(
+                m3uUrl,
+                (playlist) => {
+                    // Ищем ссылку после #EXTINF (корректный разбор m3u)
+                    const lines = playlist.split('\n').map(s => s.trim()).filter(Boolean);
+                    let streamUrl = null;
+
+                    for (let i = 0; i < lines.length; i++) {
+                        if (lines[i].startsWith('#EXTINF') && i + 1 < lines.length) {
+                            const next = lines[i + 1];
+                            if (next.startsWith('http')) {
+                                streamUrl = next;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Фолбэк: первая http-строка
+                    if (!streamUrl) {
+                        streamUrl = lines.find(line => line.startsWith('http')) || null;
+                    }
+
+                    if (!streamUrl) return self.setError('Не удалось найти ссылку в плейлисте');
+
+                    self.setDebug('stream: ' + streamUrl.substring(0, 60) + '...');
+
+                    // Сначала запускаем плеер, потом уходим назад
+                    Lampa.Player.play({
+                        url: streamUrl,
+                        title: latest.title,
+                        hash: latest.hash
+                    });
+                    Lampa.Activity.backward();
+                },
+                () => self.setError('Ошибка при получении плейлиста'),
+                false,
+                { dataType: 'text' }
+            );
+        };
+
+        this.setStatus = function (msg) {
+            html.find('.loading_status').text(msg).css('color', '');
+        };
+
         this.setError = function (msg) {
             html.find('.loading_title').text('Ошибка');
             html.find('.loading_status').text(msg).css('color', '#ff4e4e');
+        };
+
+        this.setDebug = function (msg) {
+            html.find('.loading_debug').text(msg);
         };
 
         this.render = () => html;

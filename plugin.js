@@ -2,7 +2,6 @@
     'use strict';
 
     function TestComponent(object) {
-        const network = new Lampa.Reguest();
         const scroll = new Lampa.Scroll({ mask: true, over: true });
         const html = $('<div></div>');
 
@@ -11,7 +10,7 @@
                 <div class="about" style="padding: 2rem;">
                     <h1 class="loading_title">TorrServer</h1>
                     <p class="loading_status">Подключаюсь...</p>
-                    <div class="loading_debug" style="font-size:0.75em; color:#aaa; margin-top:1.5rem; line-height:1.6;"></div>
+                    <div class="loading_debug" style="font-size:0.75em; color:#aaa; margin-top:1.5rem; line-height:1.8;"></div>
                 </div>
             `);
             html.append(scroll.render());
@@ -21,22 +20,60 @@
 
         this.start = function () {
             const self = this;
+            const serverUrl = (
+                Lampa.Storage.get('torrserver_url') ||
+                Lampa.Storage.get('torrserver_url_two') ||
+                ''
+            ).replace(/\/+$/, '');
 
-            // Собираем все возможные адреса из настроек
-            const urlOne = (Lampa.Storage.get('torrserver_url') || '').replace(/\/+$/, '');
-            const urlTwo = (Lampa.Storage.get('torrserver_url_two') || '').replace(/\/+$/, '');
+            if (!serverUrl) return this.setError('Адрес TorrServer не настроен');
 
-            this.log('torrserver_url: [' + (urlOne || 'пусто') + ']');
-            this.log('torrserver_url_two: [' + (urlTwo || 'пусто') + ']');
+            this.log('URL: ' + serverUrl);
+            this.setStatus('Запрашиваю торренты...');
 
-            const candidates = [urlOne, urlTwo].filter(Boolean);
+            // Используем $.ajax напрямую — лучше работает на Android TV
+            $.ajax({
+                url: serverUrl + '/torrents',
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({ action: 'list' }),
+                timeout: 10000,
+                success: function (result) {
+                    self.log('$.ajax POST /torrents — OK');
+                    const list = Array.isArray(result) ? result : (result.torrents || []);
+                    if (!list.length) return self.setError('Список торрентов пуст');
+                    self.playLatest(serverUrl, list);
+                },
+                error: function (xhr, status, err) {
+                    self.log('$.ajax POST ошибка: ' + status + ' / ' + err);
+                    self.log('HTTP статус: ' + xhr.status);
+                    self.log('Ответ: ' + String(xhr.responseText).substring(0, 100));
 
-            if (!candidates.length) {
-                return this.setError('Адрес TorrServer не настроен ни в одном из полей');
-            }
+                    // Пробуем через Lampa.Api если есть
+                    if (Lampa.Api && Lampa.Api.sources) {
+                        self.log('Пробую Lampa.Api...');
+                    }
 
-            this.setStatus('Проверяю серверы...');
-            this.tryNextServer(candidates, 0);
+                    // Пробуем GET без тела
+                    self.log('Пробую GET /torrents...');
+                    $.ajax({
+                        url: serverUrl + '/torrents',
+                        method: 'GET',
+                        timeout: 10000,
+                        success: function (result) {
+                            self.log('GET /torrents — OK');
+                            const list = Array.isArray(result) ? result : (result.torrents || []);
+                            if (!list.length) return self.setError('Список торрентов пуст');
+                            self.playLatest(serverUrl, list);
+                        },
+                        error: function (xhr2, status2, err2) {
+                            self.log('GET ошибка: ' + status2 + ' HTTP:' + xhr2.status);
+                            self.log('Ответ: ' + String(xhr2.responseText).substring(0, 100));
+                            self.tryEcho(serverUrl);
+                        }
+                    });
+                }
+            });
 
             Lampa.Controller.add('content', {
                 toggle() {},
@@ -45,92 +82,29 @@
             Lampa.Controller.toggle('content');
         };
 
-        // Перебираем серверы по очереди
-        this.tryNextServer = function (candidates, index) {
-            if (index >= candidates.length) {
-                this.setError('Ни один из серверов не ответил');
-                return;
-            }
+        // Если оба метода не работают — проверяем хотя бы /echo
+        // чтобы понять: сеть или API
+        this.tryEcho = function (serverUrl) {
             const self = this;
-            const url = candidates[index];
-            this.log('--- Пробую сервер: ' + url);
-            this.setStatus('Пробую: ' + url);
-            this.tryEcho(url,
-                () => self.fetchTorrents(url),
-                () => self.tryNextServer(candidates, index + 1)
-            );
-        };
-
-        // Проверка доступности сервера через /echo
-        this.tryEcho = function (serverUrl, onSuccess, onFail) {
-            const self = this;
-            this.log('GET ' + serverUrl + '/echo');
-            network.native(
-                `${serverUrl}/echo`,
-                (data) => {
-                    self.log('/echo ОК: ' + String(data).substring(0, 40));
-                    onSuccess();
+            this.log('Проверяю /echo...');
+            $.ajax({
+                url: serverUrl + '/echo',
+                method: 'GET',
+                timeout: 8000,
+                success: function (data) {
+                    self.log('/echo ОК: ' + String(data).substring(0, 60));
+                    self.setError('Сервер отвечает, но /torrents не работает.\nПришлите лог разработчику.');
                 },
-                (err) => {
-                    self.log('/echo ОШИБКА — сервер недоступен');
-                    onFail();
-                },
-                false,
-                { dataType: 'text' }
-            );
-        };
-
-        // Получаем список торрентов: сначала POST, потом GET
-        this.fetchTorrents = function (serverUrl) {
-            const self = this;
-            this.log('POST ' + serverUrl + '/torrents {"action":"list"}');
-            this.setStatus('Запрашиваю список торрентов...');
-
-            network.native(
-                `${serverUrl}/torrents`,
-                (result) => {
-                    self.log('POST /torrents ОК');
-                    const list = Array.isArray(result) ? result : (result.torrents || []);
-                    if (!list.length) return self.setError('Список торрентов пуст');
-                    self.playLatest(serverUrl, list);
-                },
-                () => {
-                    self.log('POST /torrents ОШИБКА — пробую GET');
-                    network.native(
-                        `${serverUrl}/torrents`,
-                        (result) => {
-                            self.log('GET /torrents ОК');
-                            const list = Array.isArray(result) ? result : (result.torrents || []);
-                            if (!list.length) return self.setError('Список торрентов пуст');
-                            self.playLatest(serverUrl, list);
-                        },
-                        () => {
-                            self.log('GET /torrents ОШИБКА');
-                            // Последняя попытка — /api/v1/torrents (MatriX/новые сборки)
-                            self.log('GET ' + serverUrl + '/api/v1/torrents');
-                            network.native(
-                                `${serverUrl}/api/v1/torrents`,
-                                (result) => {
-                                    self.log('/api/v1/torrents ОК');
-                                    const list = Array.isArray(result) ? result : (result.torrents || []);
-                                    if (!list.length) return self.setError('Список торрентов пуст');
-                                    self.playLatest(serverUrl, list);
-                                },
-                                () => {
-                                    self.log('/api/v1/torrents ОШИБКА');
-                                    self.setError('Сервер доступен, но не отдаёт торренты.\nПокажите лог разработчику.');
-                                },
-                                false,
-                                { dataType: 'json' }
-                            );
-                        },
-                        false,
-                        { dataType: 'json' }
-                    );
-                },
-                JSON.stringify({ action: 'list' }),
-                { dataType: 'json', contentType: 'application/json' }
-            );
+                error: function (xhr, status) {
+                    self.log('/echo ОШИБКА: ' + status + ' HTTP:' + xhr.status);
+                    if (xhr.status === 0) {
+                        self.setError('Нет доступа к серверу с этого устройства.\n(CORS или сеть)');
+                        self.log('Возможная причина: CORS-блокировка на TV');
+                    } else {
+                        self.setError('Сервер недоступен (HTTP ' + xhr.status + ')');
+                    }
+                }
+            });
         };
 
         this.playLatest = function (serverUrl, list) {
@@ -138,16 +112,16 @@
             list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
             const latest = list[0];
 
-            this.log('Найдено торрентов: ' + list.length);
-            this.log('Последний: ' + latest.title);
+            this.log('Торрентов: ' + list.length + ', последний: ' + latest.title);
             this.setStatus('Получаю плейлист...');
 
             const m3uUrl = `${serverUrl}/stream/${encodeURIComponent(latest.title)}.m3u?link=${latest.hash}&m3u&fromlast`;
-            this.log('Плейлист: ' + m3uUrl.substring(0, 80) + '...');
 
-            network.native(
-                m3uUrl,
-                (playlist) => {
+            $.ajax({
+                url: m3uUrl,
+                method: 'GET',
+                timeout: 10000,
+                success: function (playlist) {
                     const lines = playlist.split('\n').map(s => s.trim()).filter(Boolean);
                     let streamUrl = null;
 
@@ -164,12 +138,11 @@
                     }
 
                     if (!streamUrl) {
-                        self.log('Плейлист пришёл, но ссылок нет:');
-                        self.log(playlist.substring(0, 200));
+                        self.log('Плейлист пришёл без ссылок:\n' + playlist.substring(0, 200));
                         return self.setError('Не удалось найти ссылку в плейлисте');
                     }
 
-                    self.log('stream URL найден, запускаю плеер');
+                    self.log('Запускаю: ' + streamUrl.substring(0, 60) + '...');
                     Lampa.Player.play({
                         url: streamUrl,
                         title: latest.title,
@@ -177,10 +150,11 @@
                     });
                     Lampa.Activity.backward();
                 },
-                () => self.setError('Ошибка при получении плейлиста'),
-                false,
-                { dataType: 'text' }
-            );
+                error: function (xhr, status) {
+                    self.log('Ошибка плейлиста: ' + status + ' HTTP:' + xhr.status);
+                    self.setError('Ошибка при получении плейлиста');
+                }
+            });
         };
 
         this.setStatus = function (msg) {
@@ -200,7 +174,6 @@
         this.render = () => html;
 
         this.destroy = function () {
-            network.clear();
             scroll.destroy();
             html.remove();
         };

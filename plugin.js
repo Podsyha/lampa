@@ -10,8 +10,8 @@
             const status = $(`
                 <div class="about" style="padding: 2rem;">
                     <h1 class="loading_title">TorrServer</h1>
-                    <p class="loading_status">Подключаюсь к серверу...</p>
-                    <p class="loading_debug" style="font-size:0.8em; color:#aaa; margin-top:1rem;"></p>
+                    <p class="loading_status">Подключаюсь...</p>
+                    <div class="loading_debug" style="font-size:0.75em; color:#aaa; margin-top:1.5rem; line-height:1.6;"></div>
                 </div>
             `);
             html.append(scroll.render());
@@ -21,32 +21,22 @@
 
         this.start = function () {
             const self = this;
-            const serverUrl = (
-                Lampa.Storage.get('torrserver_url') ||
-                Lampa.Storage.get('torrserver_url_two') ||
-                ''
-            ).replace(/\/+$/, ''); // убираем trailing slash
 
-            if (!serverUrl) return this.setError('Адрес TorrServer не настроен');
+            // Собираем все возможные адреса из настроек
+            const urlOne = (Lampa.Storage.get('torrserver_url') || '').replace(/\/+$/, '');
+            const urlTwo = (Lampa.Storage.get('torrserver_url_two') || '').replace(/\/+$/, '');
 
-            this.setDebug('Сервер: ' + serverUrl);
-            this.setStatus('Проверяю соединение...');
+            this.log('torrserver_url: [' + (urlOne || 'пусто') + ']');
+            this.log('torrserver_url_two: [' + (urlTwo || 'пусто') + ']');
 
-            // Шаг 1: проверяем доступность через /echo
-            network.native(
-                `${serverUrl}/echo`,
-                () => {
-                    self.setStatus('Получаю список торрентов...');
-                    self.fetchTorrentList(serverUrl);
-                },
-                () => {
-                    // /echo недоступен — пробуем сразу список
-                    self.setDebug('Сервер: ' + serverUrl + ' (echo недоступен, пробую напрямую)');
-                    self.fetchTorrentList(serverUrl);
-                },
-                false,
-                { dataType: 'text' }
-            );
+            const candidates = [urlOne, urlTwo].filter(Boolean);
+
+            if (!candidates.length) {
+                return this.setError('Адрес TorrServer не настроен ни в одном из полей');
+            }
+
+            this.setStatus('Проверяю серверы...');
+            this.tryNextServer(candidates, 0);
 
             Lampa.Controller.add('content', {
                 toggle() {},
@@ -55,84 +45,131 @@
             Lampa.Controller.toggle('content');
         };
 
-        this.fetchTorrentList = function (serverUrl) {
+        // Перебираем серверы по очереди
+        this.tryNextServer = function (candidates, index) {
+            if (index >= candidates.length) {
+                this.setError('Ни один из серверов не ответил');
+                return;
+            }
             const self = this;
+            const url = candidates[index];
+            this.log('--- Пробую сервер: ' + url);
+            this.setStatus('Пробую: ' + url);
+            this.tryEcho(url,
+                () => self.fetchTorrents(url),
+                () => self.tryNextServer(candidates, index + 1)
+            );
+        };
 
-            // Шаг 2: POST /torrents с action:list (стандартный способ)
+        // Проверка доступности сервера через /echo
+        this.tryEcho = function (serverUrl, onSuccess, onFail) {
+            const self = this;
+            this.log('GET ' + serverUrl + '/echo');
+            network.native(
+                `${serverUrl}/echo`,
+                (data) => {
+                    self.log('/echo ОК: ' + String(data).substring(0, 40));
+                    onSuccess();
+                },
+                (err) => {
+                    self.log('/echo ОШИБКА — сервер недоступен');
+                    onFail();
+                },
+                false,
+                { dataType: 'text' }
+            );
+        };
+
+        // Получаем список торрентов: сначала POST, потом GET
+        this.fetchTorrents = function (serverUrl) {
+            const self = this;
+            this.log('POST ' + serverUrl + '/torrents {"action":"list"}');
+            this.setStatus('Запрашиваю список торрентов...');
+
             network.native(
                 `${serverUrl}/torrents`,
                 (result) => {
+                    self.log('POST /torrents ОК');
                     const list = Array.isArray(result) ? result : (result.torrents || []);
                     if (!list.length) return self.setError('Список торрентов пуст');
                     self.playLatest(serverUrl, list);
                 },
                 () => {
-                    // POST не сработал — пробуем GET /torrents (старые версии TorrServer)
-                    self.setDebug('POST /torrents не сработал, пробую GET...');
-                    self.fetchTorrentListGet(serverUrl);
+                    self.log('POST /torrents ОШИБКА — пробую GET');
+                    network.native(
+                        `${serverUrl}/torrents`,
+                        (result) => {
+                            self.log('GET /torrents ОК');
+                            const list = Array.isArray(result) ? result : (result.torrents || []);
+                            if (!list.length) return self.setError('Список торрентов пуст');
+                            self.playLatest(serverUrl, list);
+                        },
+                        () => {
+                            self.log('GET /torrents ОШИБКА');
+                            // Последняя попытка — /api/v1/torrents (MatriX/новые сборки)
+                            self.log('GET ' + serverUrl + '/api/v1/torrents');
+                            network.native(
+                                `${serverUrl}/api/v1/torrents`,
+                                (result) => {
+                                    self.log('/api/v1/torrents ОК');
+                                    const list = Array.isArray(result) ? result : (result.torrents || []);
+                                    if (!list.length) return self.setError('Список торрентов пуст');
+                                    self.playLatest(serverUrl, list);
+                                },
+                                () => {
+                                    self.log('/api/v1/torrents ОШИБКА');
+                                    self.setError('Сервер доступен, но не отдаёт торренты.\nПокажите лог разработчику.');
+                                },
+                                false,
+                                { dataType: 'json' }
+                            );
+                        },
+                        false,
+                        { dataType: 'json' }
+                    );
                 },
                 JSON.stringify({ action: 'list' }),
                 { dataType: 'json', contentType: 'application/json' }
             );
         };
 
-        this.fetchTorrentListGet = function (serverUrl) {
-            const self = this;
-
-            network.native(
-                `${serverUrl}/torrents`,
-                (result) => {
-                    const list = Array.isArray(result) ? result : (result.torrents || []);
-                    if (!list.length) return self.setError('Список торрентов пуст');
-                    self.playLatest(serverUrl, list);
-                },
-                () => {
-                    self.setError('Ошибка связи с TorrServer. Проверьте адрес сервера в настройках.');
-                    self.setDebug('Оба метода (POST и GET) не сработали');
-                },
-                false,
-                { dataType: 'json' }
-            );
-        };
-
         this.playLatest = function (serverUrl, list) {
             const self = this;
-
             list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
             const latest = list[0];
 
-            this.setStatus(`Получаю плейлист: ${latest.title}`);
-            this.setDebug(`hash: ${latest.hash}`);
+            this.log('Найдено торрентов: ' + list.length);
+            this.log('Последний: ' + latest.title);
+            this.setStatus('Получаю плейлист...');
 
             const m3uUrl = `${serverUrl}/stream/${encodeURIComponent(latest.title)}.m3u?link=${latest.hash}&m3u&fromlast`;
+            this.log('Плейлист: ' + m3uUrl.substring(0, 80) + '...');
 
             network.native(
                 m3uUrl,
                 (playlist) => {
-                    // Ищем ссылку после #EXTINF (корректный разбор m3u)
                     const lines = playlist.split('\n').map(s => s.trim()).filter(Boolean);
                     let streamUrl = null;
 
                     for (let i = 0; i < lines.length; i++) {
                         if (lines[i].startsWith('#EXTINF') && i + 1 < lines.length) {
-                            const next = lines[i + 1];
-                            if (next.startsWith('http')) {
-                                streamUrl = next;
+                            if (lines[i + 1].startsWith('http')) {
+                                streamUrl = lines[i + 1];
                                 break;
                             }
                         }
                     }
-
-                    // Фолбэк: первая http-строка
                     if (!streamUrl) {
                         streamUrl = lines.find(line => line.startsWith('http')) || null;
                     }
 
-                    if (!streamUrl) return self.setError('Не удалось найти ссылку в плейлисте');
+                    if (!streamUrl) {
+                        self.log('Плейлист пришёл, но ссылок нет:');
+                        self.log(playlist.substring(0, 200));
+                        return self.setError('Не удалось найти ссылку в плейлисте');
+                    }
 
-                    self.setDebug('stream: ' + streamUrl.substring(0, 60) + '...');
-
-                    // Сначала запускаем плеер, потом уходим назад
+                    self.log('stream URL найден, запускаю плеер');
                     Lampa.Player.play({
                         url: streamUrl,
                         title: latest.title,
@@ -155,8 +192,9 @@
             html.find('.loading_status').text(msg).css('color', '#ff4e4e');
         };
 
-        this.setDebug = function (msg) {
-            html.find('.loading_debug').text(msg);
+        this.log = function (msg) {
+            const el = html.find('.loading_debug');
+            el.html(el.html() + msg + '<br>');
         };
 
         this.render = () => html;

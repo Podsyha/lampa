@@ -27,49 +27,72 @@
 
                     list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
                     const latest = list[0];
+
                     self.log('Торрент: ' + latest.title);
-                    self.setStatus('Получаю файлы...');
+                    self.setStatus('Получаю плейлист...');
 
-                    ts.files(
-                        latest.hash,
-                        function (data) {
-                            self.log('files() OK');
-                            self.log('Ответ: ' + JSON.stringify(data).substring(0, 300));
+                    // ts.url() возвращает правильный адрес сервера из настроек Lampa
+                    const serverUrl = ts.url();
+                    self.log('Server URL: ' + serverUrl);
 
-                            const files = data.file_stats || data.files || data || [];
-                            const arr   = Array.isArray(files) ? files : Object.values(files);
-                            const videoExts = /\.(mkv|mp4|avi|mov|ts|m2ts|wmv|flv|webm)$/i;
-                            let target = arr.find(f => videoExts.test(f.path || f.name || ''));
-                            if (!target && arr.length) target = arr[0];
-                            if (!target) return self.setError('Нет файлов в торренте');
+                    // Строим m3u ссылку с &fromlast — TorrServer вернёт
+                    // последний просмотренный файл из этого торрента
+                    const m3uUrl = serverUrl
+                        + '/stream/' + encodeURIComponent(latest.title) + '.m3u'
+                        + '?link=' + latest.hash
+                        + '&m3u&fromlast';
 
-                            const streamUrl = ts.stream(
-                                target.path || target.name || latest.title,
-                                latest.hash,
-                                target.id !== undefined ? target.id : 1
-                            );
+                    self.log('M3U URL: ' + m3uUrl);
+                    self.setStatus('Разбираю плейлист...');
 
-                            self.log('Stream URL: ' + streamUrl);
-                            self.setStatus('Готово. Жду 5 сек...');
+                    // Загружаем m3u через Lampa.Reguest — он уже умеет работать с этим сервером
+                    const network = new Lampa.Reguest();
+                    network.native(
+                        m3uUrl,
+                        function (playlist) {
+                            if (typeof playlist !== 'string') playlist = String(playlist);
+                            self.log('Плейлист получен, строк: ' + playlist.split('\n').length);
 
-                            // Ждём 5 секунд — чтобы успеть прочитать лог
-                            // ПОСЛЕ этого запускаем плеер БЕЗ backward()
+                            const lines = playlist.split('\n').map(s => s.trim()).filter(Boolean);
+                            let streamUrl = null;
+
+                            // Ищем ссылку после #EXTINF
+                            for (let i = 0; i < lines.length; i++) {
+                                if (lines[i].startsWith('#EXTINF') && i + 1 < lines.length) {
+                                    if (lines[i + 1].startsWith('http')) {
+                                        streamUrl = lines[i + 1];
+                                        break;
+                                    }
+                                }
+                            }
+                            // Фолбэк — первая http строка
+                            if (!streamUrl) {
+                                streamUrl = lines.find(l => l.startsWith('http')) || null;
+                            }
+
+                            self.log('Stream URL: ' + (streamUrl || 'НЕ НАЙДЕН'));
+                            self.log('Жду 4 сек...');
+
+                            if (!streamUrl) return self.setError('Ссылка в плейлисте не найдена');
+
                             setTimeout(function () {
                                 Lampa.Player.play({
                                     url:   streamUrl,
                                     title: latest.title,
                                     hash:  latest.hash
                                 });
-                                // НЕ вызываем backward() — плеер сам откроется поверх
-                            }, 5000);
+                            }, 4000);
                         },
                         function (err) {
-                            self.log('files() ошибка: ' + JSON.stringify(err));
-                        }
+                            self.log('Ошибка плейлиста: ' + JSON.stringify(err));
+                            self.setError('Не удалось загрузить плейлист');
+                        },
+                        false,
+                        { dataType: 'text' }
                     );
                 },
                 function (err) {
-                    self.setError('my() ошибка: ' + JSON.stringify(err));
+                    self.setError('Ошибка: ' + JSON.stringify(err));
                 }
             );
 

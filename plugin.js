@@ -21,56 +21,86 @@
             const self = this;
             const ts   = Lampa.Torserver;
 
-            // Lampa.Torserver.my() — встроенный метод для получения списка торрентов
-            // Использует правильный URL и метод запроса из самой Lampa
             ts.my(
                 function (list) {
                     if (!list || !list.length) return self.setError('Список торрентов пуст');
 
-                    // Сортируем по времени добавления — самый свежий первый
                     list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
                     const latest = list[0];
+                    self.log('Торрент: ' + latest.title);
+                    self.log('Hash: ' + latest.hash);
+                    self.setStatus('Получаю файлы...');
 
-                    self.setStatus('Запускаю: ' + latest.title);
-
-                    // Lampa.Torserver.stream(path, hash, id) — строит правильный URL стрима
-                    // files() сначала получает список файлов в торренте
                     ts.files(
                         latest.hash,
                         function (data) {
-                            // data.file_stats — массив файлов торрента
-                            const files = data.file_stats || [];
+                            self.log('files() ответ: ' + JSON.stringify(data).substring(0, 200));
 
-                            // Ищем последний просмотренный файл или просто первый видеофайл
+                            const files = data.file_stats || data.files || data || [];
+                            const arr   = Array.isArray(files) ? files : Object.values(files);
+
                             const videoExts = /\.(mkv|mp4|avi|mov|ts|m2ts|wmv|flv|webm)$/i;
-                            let target = files.find(f => videoExts.test(f.path));
-                            if (!target && files.length) target = files[0];
+                            let target = arr.find(f => videoExts.test(f.path || f.name || ''));
+                            if (!target && arr.length) target = arr[0];
+
+                            self.log('Файл: ' + JSON.stringify(target));
 
                             if (!target) return self.setError('Нет файлов в торренте');
 
-                            // stream(path, hash, id) — родной метод Torserver
-                            const streamUrl = ts.stream(target.path, latest.hash, target.id);
-                            self.log('URL: ' + streamUrl);
+                            const streamUrl = ts.stream(
+                                target.path || target.name || latest.title,
+                                latest.hash,
+                                target.id !== undefined ? target.id : 1
+                            );
 
-                            Lampa.Player.play({
-                                url:   streamUrl,
-                                title: latest.title,
-                                hash:  latest.hash
-                            });
-                            Lampa.Activity.backward();
+                            self.log('Stream URL: ' + streamUrl);
+                            self.setStatus('Запускаю плеер...');
+
+                            // Формат вызова как в самой Lampa (TorrentPlayer)
+                            const playerData = {
+                                url:       streamUrl,
+                                title:     latest.title,
+                                hash:      latest.hash,
+                                // poster и другие поля опциональны
+                            };
+
+                            self.log('Player.play вызываю...');
+
+                            // Сначала запускаем плеер, backward только после
+                            try {
+                                Lampa.Player.play(playerData);
+                                self.log('Player.play — OK');
+                            } catch(e) {
+                                self.log('Player.play — исключение: ' + e.message);
+                                return;
+                            }
+
+                            // Небольшая задержка перед backward
+                            setTimeout(function () {
+                                Lampa.Activity.backward();
+                            }, 300);
                         },
                         function (err) {
-                            self.log('files() ошибка, пробую stream напрямую');
-                            // Если files() не сработал — пробуем stream с путём из title
-                            const streamUrl = ts.stream(latest.title, latest.hash, 1);
-                            self.log('URL: ' + streamUrl);
+                            self.log('files() ошибка: ' + JSON.stringify(err));
+                            self.log('Пробую stream без files...');
 
-                            Lampa.Player.play({
-                                url:   streamUrl,
-                                title: latest.title,
-                                hash:  latest.hash
-                            });
-                            Lampa.Activity.backward();
+                            const streamUrl = ts.stream(latest.title, latest.hash, 1);
+                            self.log('Stream URL: ' + streamUrl);
+
+                            try {
+                                Lampa.Player.play({
+                                    url:   streamUrl,
+                                    title: latest.title,
+                                    hash:  latest.hash
+                                });
+                            } catch(e) {
+                                self.log('Player.play — исключение: ' + e.message);
+                                return;
+                            }
+
+                            setTimeout(function () {
+                                Lampa.Activity.backward();
+                            }, 300);
                         }
                     );
                 },

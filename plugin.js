@@ -10,8 +10,8 @@
             scroll.append($(`
                 <div class="about" style="padding:2rem">
                     <h1 class="loading_title">TorrServer</h1>
-                    <p class="loading_status">Подключаюсь...</p>
-                    <div class="loading_debug" style="font-size:.75em;color:#aaa;margin-top:1.5rem;line-height:1.9;word-break:break-all"></div>
+                    <p class="loading_status">Ищу последний файл...</p>
+                    <div class="loading_debug" style="font-size:.75em;color:#aaa;margin-top:1.5rem;line-height:1.9"></div>
                 </div>
             `));
             return this.render();
@@ -19,41 +19,66 @@
 
         this.start = function () {
             const self = this;
-            const ts = Lampa.Torserver;
+            const ts   = Lampa.Torserver;
 
-            // Глубокий осмотр Lampa.Torserver
-            this.log('<b style="color:#fff">Тип:</b> ' + typeof ts);
-            this.log('<b style="color:#fff">Own keys:</b> ' + Object.keys(ts).join(', '));
-            try {
-                const proto = Object.getPrototypeOf(ts);
-                this.log('<b style="color:#fff">Proto keys:</b> ' + Object.getOwnPropertyNames(proto).join(', '));
-            } catch(e) {}
+            // Lampa.Torserver.my() — встроенный метод для получения списка торрентов
+            // Использует правильный URL и метод запроса из самой Lampa
+            ts.my(
+                function (list) {
+                    if (!list || !list.length) return self.setError('Список торрентов пуст');
 
-            // Печатаем строковое представление каждого метода (первые 80 символов)
-            Object.keys(ts).forEach(function(key) {
-                if (typeof ts[key] === 'function') {
-                    self.log('<b style="color:#8f8">' + key + ':</b> ' + String(ts[key]).substring(0, 120).replace(/\n/g, ' '));
-                } else {
-                    self.log('<b style="color:#8af">' + key + ':</b> ' + JSON.stringify(ts[key]));
+                    // Сортируем по времени добавления — самый свежий первый
+                    list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+                    const latest = list[0];
+
+                    self.setStatus('Запускаю: ' + latest.title);
+
+                    // Lampa.Torserver.stream(path, hash, id) — строит правильный URL стрима
+                    // files() сначала получает список файлов в торренте
+                    ts.files(
+                        latest.hash,
+                        function (data) {
+                            // data.file_stats — массив файлов торрента
+                            const files = data.file_stats || [];
+
+                            // Ищем последний просмотренный файл или просто первый видеофайл
+                            const videoExts = /\.(mkv|mp4|avi|mov|ts|m2ts|wmv|flv|webm)$/i;
+                            let target = files.find(f => videoExts.test(f.path));
+                            if (!target && files.length) target = files[0];
+
+                            if (!target) return self.setError('Нет файлов в торренте');
+
+                            // stream(path, hash, id) — родной метод Torserver
+                            const streamUrl = ts.stream(target.path, latest.hash, target.id);
+                            self.log('URL: ' + streamUrl);
+
+                            Lampa.Player.play({
+                                url:   streamUrl,
+                                title: latest.title,
+                                hash:  latest.hash
+                            });
+                            Lampa.Activity.backward();
+                        },
+                        function (err) {
+                            self.log('files() ошибка, пробую stream напрямую');
+                            // Если files() не сработал — пробуем stream с путём из title
+                            const streamUrl = ts.stream(latest.title, latest.hash, 1);
+                            self.log('URL: ' + streamUrl);
+
+                            Lampa.Player.play({
+                                url:   streamUrl,
+                                title: latest.title,
+                                hash:  latest.hash
+                            });
+                            Lampa.Activity.backward();
+                        }
+                    );
+                },
+                function (err) {
+                    self.log('my() ошибка: ' + JSON.stringify(err));
+                    self.setError('Не удалось получить список торрентов');
                 }
-            });
-
-            // Что хранится в Storage под ключами torrserver
-            const allKeys = ['torrserver_url', 'torrserver_url_two', 'ts_url', 'torserver', 'torserver_url'];
-            this.log('<br><b style="color:#fff">Storage:</b>');
-            allKeys.forEach(function(k) {
-                const v = Lampa.Storage.get(k);
-                if (v) self.log(k + ' = ' + v);
-            });
-
-            // Точный URL который сейчас строит наш код
-            const rawUrl = Lampa.Storage.get('torrserver_url') || Lampa.Storage.get('torrserver_url_two') || '';
-            this.log('<br><b style="color:#fff">rawUrl:</b> [' + rawUrl + ']');
-            this.log('length: ' + rawUrl.length);
-            // Коды первых символов — покажет невидимые символы
-            let codes = '';
-            for (let i = 0; i < Math.min(rawUrl.length, 30); i++) codes += rawUrl.charCodeAt(i) + ' ';
-            this.log('charCodes: ' + codes);
+            );
 
             Lampa.Controller.add('content', {
                 toggle() {},
@@ -62,6 +87,11 @@
             Lampa.Controller.toggle('content');
         };
 
+        this.setStatus = function (msg) { html.find('.loading_status').text(msg).css('color', ''); };
+        this.setError  = function (msg) {
+            html.find('.loading_title').text('Ошибка');
+            html.find('.loading_status').text(msg).css('color', '#ff4e4e');
+        };
         this.log = function (msg) {
             const el = html.find('.loading_debug');
             el.html(el.html() + msg + '<br>');
@@ -86,7 +116,7 @@
                 </li>
             `);
             item.on('hover:enter', () => {
-                Lampa.Activity.push({ title: 'Диагностика', component: 'test_plugin', page: 1 });
+                Lampa.Activity.push({ title: 'Загрузка...', component: 'test_plugin', page: 1 });
             });
             $('.menu .menu__list').first().append(item);
         }

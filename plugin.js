@@ -1,20 +1,71 @@
 (function () {
     'use strict';
 
+    // Универсальная функция запроса:
+    // 1. Если есть Android-оболочка Lampa — используем нативный fetch (обходит CORS)
+    // 2. Иначе — $.ajax (для браузера/других платформ)
+    function nativeFetch(opts) {
+        // opts: { url, method, body, headers, success, error }
+        const method  = opts.method  || 'GET';
+        const body    = opts.body    || null;
+        const headers = opts.headers || {};
+
+        // Способ 1: Lampa.Nativerequest (есть в Android-сборках Lampa)
+        if (window.Lampa && Lampa.Nativerequest) {
+            Lampa.Nativerequest.request(
+                { url: opts.url, method: method, headers: headers, body: body || '' },
+                function (response) {
+                    try {
+                        const data = typeof response === 'string' ? JSON.parse(response) : response;
+                        opts.success(data);
+                    } catch (e) {
+                        opts.success(response); // вернём как есть (для text-ответов)
+                    }
+                },
+                function (err) { opts.error('Nativerequest: ' + err); }
+            );
+            return;
+        }
+
+        // Способ 2: Android-интерфейс напрямую (старые сборки)
+        if (window.Android && Android.request) {
+            try {
+                const result = Android.request(opts.url, method, body || '', JSON.stringify(headers));
+                const data = typeof result === 'string' ? JSON.parse(result) : result;
+                opts.success(data);
+            } catch (e) {
+                opts.error('Android.request: ' + e.message);
+            }
+            return;
+        }
+
+        // Способ 3: $.ajax (браузер, fallback)
+        $.ajax({
+            url:         opts.url,
+            method:      method,
+            contentType: headers['Content-Type'] || 'application/json',
+            data:        body,
+            timeout:     12000,
+            success:     opts.success,
+            error: function (xhr, status, err) {
+                opts.error('$.ajax [' + xhr.status + '] ' + status + ' ' + err);
+            }
+        });
+    }
+
     function TestComponent(object) {
         const scroll = new Lampa.Scroll({ mask: true, over: true });
-        const html = $('<div></div>');
+        const html   = $('<div></div>');
 
         this.create = function () {
-            const status = $(`
-                <div class="about" style="padding: 2rem;">
+            html.append(scroll.render());
+            scroll.append($(`
+                <div class="about" style="padding:2rem">
                     <h1 class="loading_title">TorrServer</h1>
                     <p class="loading_status">Подключаюсь...</p>
-                    <div class="loading_debug" style="font-size:0.75em; color:#aaa; margin-top:1.5rem; line-height:1.8;"></div>
+                    <div class="loading_debug" style="font-size:.75em;color:#aaa;margin-top:1.5rem;line-height:1.8"></div>
                 </div>
-            `);
-            html.append(scroll.render());
-            scroll.append(status);
+            `));
             return this.render();
         };
 
@@ -22,54 +73,45 @@
             const self = this;
             const serverUrl = (
                 Lampa.Storage.get('torrserver_url') ||
-                Lampa.Storage.get('torrserver_url_two') ||
-                ''
+                Lampa.Storage.get('torrserver_url_two') || ''
             ).replace(/\/+$/, '');
 
             if (!serverUrl) return this.setError('Адрес TorrServer не настроен');
 
+            // Показываем какой метод запроса будет использован
+            const method = window.Lampa && Lampa.Nativerequest ? 'Nativerequest'
+                         : window.Android && Android.request    ? 'Android.request'
+                         : '$.ajax (CORS может блокировать)';
+            this.log('Метод: ' + method);
             this.log('URL: ' + serverUrl);
-            this.setStatus('Запрашиваю торренты...');
+            this.setStatus('Запрашиваю список торрентов...');
 
-            // Используем $.ajax напрямую — лучше работает на Android TV
-            $.ajax({
-                url: serverUrl + '/torrents',
-                method: 'POST',
-                contentType: 'application/json',
-                data: JSON.stringify({ action: 'list' }),
-                timeout: 10000,
+            nativeFetch({
+                url:     serverUrl + '/torrents',
+                method:  'POST',
+                body:    JSON.stringify({ action: 'list' }),
+                headers: { 'Content-Type': 'application/json' },
                 success: function (result) {
-                    self.log('$.ajax POST /torrents — OK');
+                    self.log('POST /torrents — OK');
                     const list = Array.isArray(result) ? result : (result.torrents || []);
                     if (!list.length) return self.setError('Список торрентов пуст');
                     self.playLatest(serverUrl, list);
                 },
-                error: function (xhr, status, err) {
-                    self.log('$.ajax POST ошибка: ' + status + ' / ' + err);
-                    self.log('HTTP статус: ' + xhr.status);
-                    self.log('Ответ: ' + String(xhr.responseText).substring(0, 100));
-
-                    // Пробуем через Lampa.Api если есть
-                    if (Lampa.Api && Lampa.Api.sources) {
-                        self.log('Пробую Lampa.Api...');
-                    }
-
-                    // Пробуем GET без тела
-                    self.log('Пробую GET /torrents...');
-                    $.ajax({
-                        url: serverUrl + '/torrents',
+                error: function (err) {
+                    self.log('POST /torrents — ' + err);
+                    // Пробуем GET
+                    nativeFetch({
+                        url:    serverUrl + '/torrents',
                         method: 'GET',
-                        timeout: 10000,
                         success: function (result) {
                             self.log('GET /torrents — OK');
                             const list = Array.isArray(result) ? result : (result.torrents || []);
                             if (!list.length) return self.setError('Список торрентов пуст');
                             self.playLatest(serverUrl, list);
                         },
-                        error: function (xhr2, status2, err2) {
-                            self.log('GET ошибка: ' + status2 + ' HTTP:' + xhr2.status);
-                            self.log('Ответ: ' + String(xhr2.responseText).substring(0, 100));
-                            self.tryEcho(serverUrl);
+                        error: function (err2) {
+                            self.log('GET /torrents — ' + err2);
+                            self.setError('Нет доступа к TorrServer.\nМетод: ' + method);
                         }
                     });
                 }
@@ -82,46 +124,22 @@
             Lampa.Controller.toggle('content');
         };
 
-        // Если оба метода не работают — проверяем хотя бы /echo
-        // чтобы понять: сеть или API
-        this.tryEcho = function (serverUrl) {
-            const self = this;
-            this.log('Проверяю /echo...');
-            $.ajax({
-                url: serverUrl + '/echo',
-                method: 'GET',
-                timeout: 8000,
-                success: function (data) {
-                    self.log('/echo ОК: ' + String(data).substring(0, 60));
-                    self.setError('Сервер отвечает, но /torrents не работает.\nПришлите лог разработчику.');
-                },
-                error: function (xhr, status) {
-                    self.log('/echo ОШИБКА: ' + status + ' HTTP:' + xhr.status);
-                    if (xhr.status === 0) {
-                        self.setError('Нет доступа к серверу с этого устройства.\n(CORS или сеть)');
-                        self.log('Возможная причина: CORS-блокировка на TV');
-                    } else {
-                        self.setError('Сервер недоступен (HTTP ' + xhr.status + ')');
-                    }
-                }
-            });
-        };
-
         this.playLatest = function (serverUrl, list) {
             const self = this;
             list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
             const latest = list[0];
 
-            this.log('Торрентов: ' + list.length + ', последний: ' + latest.title);
+            this.log('Последний: ' + latest.title);
             this.setStatus('Получаю плейлист...');
 
             const m3uUrl = `${serverUrl}/stream/${encodeURIComponent(latest.title)}.m3u?link=${latest.hash}&m3u&fromlast`;
 
-            $.ajax({
-                url: m3uUrl,
+            nativeFetch({
+                url:    m3uUrl,
                 method: 'GET',
-                timeout: 10000,
                 success: function (playlist) {
+                    // nativeFetch мог распарсить как JSON — обратно в строку
+                    if (typeof playlist !== 'string') playlist = JSON.stringify(playlist);
                     const lines = playlist.split('\n').map(s => s.trim()).filter(Boolean);
                     let streamUrl = null;
 
@@ -133,50 +151,34 @@
                             }
                         }
                     }
+                    if (!streamUrl) streamUrl = lines.find(l => l.startsWith('http')) || null;
                     if (!streamUrl) {
-                        streamUrl = lines.find(line => line.startsWith('http')) || null;
-                    }
-
-                    if (!streamUrl) {
-                        self.log('Плейлист пришёл без ссылок:\n' + playlist.substring(0, 200));
+                        self.log('Плейлист:\n' + playlist.substring(0, 300));
                         return self.setError('Не удалось найти ссылку в плейлисте');
                     }
 
-                    self.log('Запускаю: ' + streamUrl.substring(0, 60) + '...');
-                    Lampa.Player.play({
-                        url: streamUrl,
-                        title: latest.title,
-                        hash: latest.hash
-                    });
+                    self.log('Запускаю плеер...');
+                    Lampa.Player.play({ url: streamUrl, title: latest.title, hash: latest.hash });
                     Lampa.Activity.backward();
                 },
-                error: function (xhr, status) {
-                    self.log('Ошибка плейлиста: ' + status + ' HTTP:' + xhr.status);
+                error: function (err) {
+                    self.log('Плейлист — ' + err);
                     self.setError('Ошибка при получении плейлиста');
                 }
             });
         };
 
-        this.setStatus = function (msg) {
-            html.find('.loading_status').text(msg).css('color', '');
-        };
-
-        this.setError = function (msg) {
+        this.setStatus = function (msg) { html.find('.loading_status').text(msg).css('color', ''); };
+        this.setError  = function (msg) {
             html.find('.loading_title').text('Ошибка');
             html.find('.loading_status').text(msg).css('color', '#ff4e4e');
         };
-
         this.log = function (msg) {
             const el = html.find('.loading_debug');
             el.html(el.html() + msg + '<br>');
         };
-
-        this.render = () => html;
-
-        this.destroy = function () {
-            scroll.destroy();
-            html.remove();
-        };
+        this.render  = () => html;
+        this.destroy = function () { scroll.destroy(); html.remove(); };
     }
 
     function startPlugin() {
@@ -184,7 +186,6 @@
 
         function addMenuItem() {
             if ($('.menu__item[data-type="test_plugin_button"]').length) return;
-
             const item = $(`
                 <li class="menu__item selector" data-type="test_plugin_button">
                     <div class="menu__ico">
@@ -195,24 +196,14 @@
                     <div class="menu__text">Продолжить просмотр</div>
                 </li>
             `);
-
             item.on('hover:enter', () => {
-                Lampa.Activity.push({
-                    title: 'Загрузка...',
-                    component: 'test_plugin',
-                    page: 1
-                });
+                Lampa.Activity.push({ title: 'Загрузка...', component: 'test_plugin', page: 1 });
             });
-
             $('.menu .menu__list').first().append(item);
         }
 
         if (window.appready) addMenuItem();
-        else {
-            Lampa.Listener.follow('app', (event) => {
-                if (event.type === 'ready') addMenuItem();
-            });
-        }
+        else Lampa.Listener.follow('app', e => { if (e.type === 'ready') addMenuItem(); });
     }
 
     if (!window.test_plugin_ready) {

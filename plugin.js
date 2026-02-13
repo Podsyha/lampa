@@ -1,58 +1,7 @@
 (function () {
     'use strict';
 
-    // Универсальная функция запроса:
-    // 1. Если есть Android-оболочка Lampa — используем нативный fetch (обходит CORS)
-    // 2. Иначе — $.ajax (для браузера/других платформ)
-    function nativeFetch(opts) {
-        // opts: { url, method, body, headers, success, error }
-        const method  = opts.method  || 'GET';
-        const body    = opts.body    || null;
-        const headers = opts.headers || {};
-
-        // Способ 1: Lampa.Nativerequest (есть в Android-сборках Lampa)
-        if (window.Lampa && Lampa.Nativerequest) {
-            Lampa.Nativerequest.request(
-                { url: opts.url, method: method, headers: headers, body: body || '' },
-                function (response) {
-                    try {
-                        const data = typeof response === 'string' ? JSON.parse(response) : response;
-                        opts.success(data);
-                    } catch (e) {
-                        opts.success(response); // вернём как есть (для text-ответов)
-                    }
-                },
-                function (err) { opts.error('Nativerequest: ' + err); }
-            );
-            return;
-        }
-
-        // Способ 2: Android-интерфейс напрямую (старые сборки)
-        if (window.Android && Android.request) {
-            try {
-                const result = Android.request(opts.url, method, body || '', JSON.stringify(headers));
-                const data = typeof result === 'string' ? JSON.parse(result) : result;
-                opts.success(data);
-            } catch (e) {
-                opts.error('Android.request: ' + e.message);
-            }
-            return;
-        }
-
-        // Способ 3: $.ajax (браузер, fallback)
-        $.ajax({
-            url:         opts.url,
-            method:      method,
-            contentType: headers['Content-Type'] || 'application/json',
-            data:        body,
-            timeout:     12000,
-            success:     opts.success,
-            error: function (xhr, status, err) {
-                opts.error('$.ajax [' + xhr.status + '] ' + status + ' ' + err);
-            }
-        });
-    }
-
+    // ─── Диагностика: что доступно в этой сборке Lampa ───────────────────────
     function TestComponent(object) {
         const scroll = new Lampa.Scroll({ mask: true, over: true });
         const html   = $('<div></div>');
@@ -61,9 +10,9 @@
             html.append(scroll.render());
             scroll.append($(`
                 <div class="about" style="padding:2rem">
-                    <h1 class="loading_title">TorrServer</h1>
-                    <p class="loading_status">Подключаюсь...</p>
-                    <div class="loading_debug" style="font-size:.75em;color:#aaa;margin-top:1.5rem;line-height:1.8"></div>
+                    <h1 class="loading_title">Диагностика</h1>
+                    <p class="loading_status">Проверяю доступные методы...</p>
+                    <div class="loading_debug" style="font-size:.75em;color:#aaa;margin-top:1.5rem;line-height:1.9;word-break:break-all"></div>
                 </div>
             `));
             return this.render();
@@ -71,51 +20,76 @@
 
         this.start = function () {
             const self = this;
+
+            // 1. Показываем всё что есть в window.Lampa
+            const lampaKeys = Object.keys(window.Lampa || {}).sort().join(', ');
+            this.log('<b style="color:#fff">Lampa.*:</b> ' + lampaKeys);
+
+            // 2. Показываем всё что есть в window.Android
+            const androidKeys = window.Android ? Object.keys(window.Android).join(', ') : 'отсутствует';
+            this.log('<b style="color:#fff">Android.*:</b> ' + androidKeys);
+
+            // 3. Проверяем конкретные методы
+            const checks = [
+                ['Lampa.Nativerequest',      !!(window.Lampa && Lampa.Nativerequest)],
+                ['Lampa.Nativerequest.request', !!(window.Lampa && Lampa.Nativerequest && Lampa.Nativerequest.request)],
+                ['Lampa.Nativerequest.native',  !!(window.Lampa && Lampa.Nativerequest && Lampa.Nativerequest.native)],
+                ['Lampa.Reguest',            !!(window.Lampa && Lampa.Reguest)],
+                ['Lampa.Utils.native',       !!(window.Lampa && Lampa.Utils && Lampa.Utils.native)],
+                ['Android.request',          !!(window.Android && Android.request)],
+                ['Android.fetch',            !!(window.Android && Android.fetch)],
+                ['Android.network',          !!(window.Android && Android.network)],
+                ['window.fetch',             !!window.fetch],
+                ['XMLHttpRequest',           !!window.XMLHttpRequest],
+            ];
+            this.log('<br><b style="color:#fff">Проверка методов:</b>');
+            checks.forEach(([name, ok]) => {
+                self.log((ok ? '✓ ' : '✗ ') + name);
+            });
+
+            // 4. Проверяем что внутри Lampa.Reguest если он есть
+            if (window.Lampa && Lampa.Reguest) {
+                try {
+                    const r = new Lampa.Reguest();
+                    const rKeys = Object.getOwnPropertyNames(Object.getPrototypeOf(r))
+                        .concat(Object.keys(r)).join(', ');
+                    this.log('<br><b style="color:#fff">Lampa.Reguest методы:</b> ' + rKeys);
+                } catch(e) {
+                    this.log('Lampa.Reguest ошибка: ' + e.message);
+                }
+            }
+
+            // 5. Пробуем XMLHttpRequest напрямую (без jQuery) — он иногда работает там где $.ajax нет
+            this.log('<br><b style="color:#fff">Тест XHR:</b>');
             const serverUrl = (
                 Lampa.Storage.get('torrserver_url') ||
                 Lampa.Storage.get('torrserver_url_two') || ''
             ).replace(/\/+$/, '');
-
-            if (!serverUrl) return this.setError('Адрес TorrServer не настроен');
-
-            // Показываем какой метод запроса будет использован
-            const method = window.Lampa && Lampa.Nativerequest ? 'Nativerequest'
-                         : window.Android && Android.request    ? 'Android.request'
-                         : '$.ajax (CORS может блокировать)';
-            this.log('Метод: ' + method);
             this.log('URL: ' + serverUrl);
-            this.setStatus('Запрашиваю список торрентов...');
 
-            nativeFetch({
-                url:     serverUrl + '/torrents',
-                method:  'POST',
-                body:    JSON.stringify({ action: 'list' }),
-                headers: { 'Content-Type': 'application/json' },
-                success: function (result) {
-                    self.log('POST /torrents — OK');
-                    const list = Array.isArray(result) ? result : (result.torrents || []);
-                    if (!list.length) return self.setError('Список торрентов пуст');
-                    self.playLatest(serverUrl, list);
-                },
-                error: function (err) {
-                    self.log('POST /torrents — ' + err);
-                    // Пробуем GET
-                    nativeFetch({
-                        url:    serverUrl + '/torrents',
-                        method: 'GET',
-                        success: function (result) {
-                            self.log('GET /torrents — OK');
-                            const list = Array.isArray(result) ? result : (result.torrents || []);
-                            if (!list.length) return self.setError('Список торрентов пуст');
-                            self.playLatest(serverUrl, list);
-                        },
-                        error: function (err2) {
-                            self.log('GET /torrents — ' + err2);
-                            self.setError('Нет доступа к TorrServer.\nМетод: ' + method);
-                        }
-                    });
-                }
-            });
+            if (serverUrl && window.XMLHttpRequest) {
+                const xhr = new XMLHttpRequest();
+                xhr.open('GET', serverUrl + '/echo', true);
+                xhr.timeout = 8000;
+                xhr.onload = function () {
+                    self.log('XHR /echo — HTTP ' + xhr.status + ': ' + xhr.responseText.substring(0, 60));
+                };
+                xhr.onerror = function () {
+                    self.log('XHR /echo — onerror (CORS или сеть)');
+                };
+                xhr.ontimeout = function () {
+                    self.log('XHR /echo — timeout');
+                };
+                xhr.send();
+            }
+
+            // 6. Пробуем window.fetch если есть
+            if (serverUrl && window.fetch) {
+                this.log('<br><b style="color:#fff">Тест window.fetch:</b>');
+                fetch(serverUrl + '/echo', { method: 'GET', mode: 'no-cors' })
+                    .then(() => self.log('fetch /echo — ответил (no-cors, статус неизвестен)'))
+                    .catch(e => self.log('fetch /echo — ошибка: ' + e.message));
+            }
 
             Lampa.Controller.add('content', {
                 toggle() {},
@@ -124,55 +98,6 @@
             Lampa.Controller.toggle('content');
         };
 
-        this.playLatest = function (serverUrl, list) {
-            const self = this;
-            list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-            const latest = list[0];
-
-            this.log('Последний: ' + latest.title);
-            this.setStatus('Получаю плейлист...');
-
-            const m3uUrl = `${serverUrl}/stream/${encodeURIComponent(latest.title)}.m3u?link=${latest.hash}&m3u&fromlast`;
-
-            nativeFetch({
-                url:    m3uUrl,
-                method: 'GET',
-                success: function (playlist) {
-                    // nativeFetch мог распарсить как JSON — обратно в строку
-                    if (typeof playlist !== 'string') playlist = JSON.stringify(playlist);
-                    const lines = playlist.split('\n').map(s => s.trim()).filter(Boolean);
-                    let streamUrl = null;
-
-                    for (let i = 0; i < lines.length; i++) {
-                        if (lines[i].startsWith('#EXTINF') && i + 1 < lines.length) {
-                            if (lines[i + 1].startsWith('http')) {
-                                streamUrl = lines[i + 1];
-                                break;
-                            }
-                        }
-                    }
-                    if (!streamUrl) streamUrl = lines.find(l => l.startsWith('http')) || null;
-                    if (!streamUrl) {
-                        self.log('Плейлист:\n' + playlist.substring(0, 300));
-                        return self.setError('Не удалось найти ссылку в плейлисте');
-                    }
-
-                    self.log('Запускаю плеер...');
-                    Lampa.Player.play({ url: streamUrl, title: latest.title, hash: latest.hash });
-                    Lampa.Activity.backward();
-                },
-                error: function (err) {
-                    self.log('Плейлист — ' + err);
-                    self.setError('Ошибка при получении плейлиста');
-                }
-            });
-        };
-
-        this.setStatus = function (msg) { html.find('.loading_status').text(msg).css('color', ''); };
-        this.setError  = function (msg) {
-            html.find('.loading_title').text('Ошибка');
-            html.find('.loading_status').text(msg).css('color', '#ff4e4e');
-        };
         this.log = function (msg) {
             const el = html.find('.loading_debug');
             el.html(el.html() + msg + '<br>');
@@ -197,7 +122,7 @@
                 </li>
             `);
             item.on('hover:enter', () => {
-                Lampa.Activity.push({ title: 'Загрузка...', component: 'test_plugin', page: 1 });
+                Lampa.Activity.push({ title: 'Диагностика', component: 'test_plugin', page: 1 });
             });
             $('.menu .menu__list').first().append(item);
         }

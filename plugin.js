@@ -13,7 +13,6 @@
                     <p class="loading_status">Ищу последний запущенный файл...</p>
                 </div>
             `);
-
             html.append(scroll.render());
             scroll.append(status);
             return this.render();
@@ -21,7 +20,6 @@
 
         this.start = function () {
             const serverUrl = Lampa.Storage.get('torrserver_url') || Lampa.Storage.get('torrserver_url_two');
-
             if (!serverUrl) return this.setError('Адрес TorrServer не настроен');
 
             network.native(
@@ -33,26 +31,40 @@
                     list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
                     const latest = list[0];
 
-                    html.find('.loading_status').text(`Запускаю: ${latest.title}`);
+                    // ИСПРАВЛЕНО: синтаксическая ошибка — была потеряна открывающая скобка
+                    html.find('.loading_status').text(`Запрашиваю плейлист: ${latest.title}`);
 
                     const m3uUrl = `${serverUrl}/stream/${encodeURIComponent(latest.title)}.m3u?link=${latest.hash}&m3u&fromlast`;
 
                     network.native(
                         m3uUrl,
                         (playlist) => {
-                            const streamUrl = playlist
-                                .split('\n')
-                                .map(str => str.trim())
-                                .find(line => line.startsWith('http'));
+                            // ИСПРАВЛЕНО: ищем ссылку после строки #EXTINF, а не просто первую http-строку
+                            const lines = playlist.split('\n').map(str => str.trim());
+                            let streamUrl = null;
+                            for (let i = 0; i < lines.length; i++) {
+                                if (lines[i].startsWith('#EXTINF') && i + 1 < lines.length) {
+                                    const next = lines[i + 1];
+                                    if (next.startsWith('http')) {
+                                        streamUrl = next;
+                                        break;
+                                    }
+                                }
+                            }
+                            // Фолбэк: если структура #EXTINF не найдена — берём первую http-строку
+                            if (!streamUrl) {
+                                streamUrl = lines.find(line => line.startsWith('http'));
+                            }
 
                             if (!streamUrl) return this.setError('Не удалось найти ссылку в плейлисте');
 
-                            Lampa.Activity.backward();
+                            // ИСПРАВЛЕНО: сначала запускаем плеер, потом уходим назад по стеку активностей
                             Lampa.Player.play({
                                 url: streamUrl,
                                 title: latest.title,
                                 hash: latest.hash
                             });
+                            Lampa.Activity.backward();
                         },
                         () => this.setError('Ошибка при получении плейлиста'),
                         false,

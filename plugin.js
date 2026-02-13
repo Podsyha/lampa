@@ -11,7 +11,7 @@
                 <div class="about" style="padding:2rem">
                     <h1 class="loading_title">TorrServer</h1>
                     <p class="loading_status">Подключаюсь...</p>
-                    <div class="loading_debug" style="font-size:.75em;color:#aaa;margin-top:1.5rem;line-height:1.9"></div>
+                    <div class="loading_debug" style="font-size:.75em;color:#aaa;margin-top:1.5rem;line-height:1.9;word-break:break-all"></div>
                 </div>
             `));
             return this.render();
@@ -19,79 +19,41 @@
 
         this.start = function () {
             const self = this;
-
-            // Lampa.Torserver — встроенный модуль Lampa для работы с TorrServer
-            // Он уже знает адрес сервера из настроек и умеет делать запросы в обход CORS
             const ts = Lampa.Torserver;
 
-            this.log('Lampa.Torserver: ' + (ts ? 'есть' : 'нет'));
+            // Глубокий осмотр Lampa.Torserver
+            this.log('<b style="color:#fff">Тип:</b> ' + typeof ts);
+            this.log('<b style="color:#fff">Own keys:</b> ' + Object.keys(ts).join(', '));
+            try {
+                const proto = Object.getPrototypeOf(ts);
+                this.log('<b style="color:#fff">Proto keys:</b> ' + Object.getOwnPropertyNames(proto).join(', '));
+            } catch(e) {}
 
-            if (!ts) return this.setError('Lampa.Torserver не найден');
+            // Печатаем строковое представление каждого метода (первые 80 символов)
+            Object.keys(ts).forEach(function(key) {
+                if (typeof ts[key] === 'function') {
+                    self.log('<b style="color:#8f8">' + key + ':</b> ' + String(ts[key]).substring(0, 120).replace(/\n/g, ' '));
+                } else {
+                    self.log('<b style="color:#8af">' + key + ':</b> ' + JSON.stringify(ts[key]));
+                }
+            });
 
-            // Изучаем что внутри
-            const tsKeys = Object.keys(ts).concat(
-                Object.getOwnPropertyNames(Object.getPrototypeOf(ts) || {})
-            ).filter((v, i, a) => a.indexOf(v) === i).join(', ');
-            this.log('Torserver методы: ' + tsKeys);
+            // Что хранится в Storage под ключами torrserver
+            const allKeys = ['torrserver_url', 'torrserver_url_two', 'ts_url', 'torserver', 'torserver_url'];
+            this.log('<br><b style="color:#fff">Storage:</b>');
+            allKeys.forEach(function(k) {
+                const v = Lampa.Storage.get(k);
+                if (v) self.log(k + ' = ' + v);
+            });
 
-            this.setStatus('Получаю список торрентов...');
-
-            // Способ 1: Lampa.Torserver.torrents() — если такой метод есть
-            if (typeof ts.torrents === 'function') {
-                this.log('Использую ts.torrents()');
-                ts.torrents(
-                    function (list) {
-                        self.log('ts.torrents OK, штук: ' + (list || []).length);
-                        if (!list || !list.length) return self.setError('Список торрентов пуст');
-                        self.playLatest(list);
-                    },
-                    function (err) {
-                        self.log('ts.torrents ошибка: ' + JSON.stringify(err));
-                        self.tryReguest();
-                    }
-                );
-                return;
-            }
-
-            // Способ 2: Lampa.Torserver.list()
-            if (typeof ts.list === 'function') {
-                this.log('Использую ts.list()');
-                ts.list(
-                    function (list) {
-                        self.log('ts.list OK, штук: ' + (list || []).length);
-                        if (!list || !list.length) return self.setError('Список торрентов пуст');
-                        self.playLatest(list);
-                    },
-                    function (err) {
-                        self.log('ts.list ошибка: ' + JSON.stringify(err));
-                        self.tryReguest();
-                    }
-                );
-                return;
-            }
-
-            // Способ 3: Lampa.Torserver.get() или .send()
-            if (typeof ts.send === 'function') {
-                this.log('Использую ts.send({action:list})');
-                ts.send(
-                    { action: 'list' },
-                    function (result) {
-                        const list = Array.isArray(result) ? result : (result.torrents || []);
-                        self.log('ts.send OK, штук: ' + list.length);
-                        if (!list.length) return self.setError('Список торрентов пуст');
-                        self.playLatest(list);
-                    },
-                    function (err) {
-                        self.log('ts.send ошибка: ' + JSON.stringify(err));
-                        self.tryReguest();
-                    }
-                );
-                return;
-            }
-
-            // Если ни один из методов не подошёл — логируем и пробуем Reguest
-            this.log('Известные методы Torserver не найдены, пробую Reguest...');
-            this.tryReguest();
+            // Точный URL который сейчас строит наш код
+            const rawUrl = Lampa.Storage.get('torrserver_url') || Lampa.Storage.get('torrserver_url_two') || '';
+            this.log('<br><b style="color:#fff">rawUrl:</b> [' + rawUrl + ']');
+            this.log('length: ' + rawUrl.length);
+            // Коды первых символов — покажет невидимые символы
+            let codes = '';
+            for (let i = 0; i < Math.min(rawUrl.length, 30); i++) codes += rawUrl.charCodeAt(i) + ' ';
+            this.log('charCodes: ' + codes);
 
             Lampa.Controller.add('content', {
                 toggle() {},
@@ -100,88 +62,6 @@
             Lampa.Controller.toggle('content');
         };
 
-        // Fallback через Lampa.Reguest (он есть по диагностике)
-        this.tryReguest = function () {
-            const self = this;
-            const serverUrl = (
-                Lampa.Storage.get('torrserver_url') ||
-                Lampa.Storage.get('torrserver_url_two') || ''
-            ).replace(/\/+$/, '');
-
-            if (!serverUrl) return this.setError('Адрес TorrServer не настроен');
-
-            this.log('Reguest POST ' + serverUrl + '/torrents');
-            const network = new Lampa.Reguest();
-
-            network.native(
-                serverUrl + '/torrents',
-                function (result) {
-                    self.log('Reguest OK');
-                    const list = Array.isArray(result) ? result : (result.torrents || []);
-                    if (!list.length) return self.setError('Список торрентов пуст');
-                    self.playLatest(list);
-                },
-                function (a, b, c) {
-                    self.log('Reguest ошибка: ' + JSON.stringify([a, b, c]));
-                    self.setError('Все методы исчерпаны.\nПришлите лог разработчику.');
-                },
-                JSON.stringify({ action: 'list' }),
-                { dataType: 'json', contentType: 'application/json' }
-            );
-        };
-
-        this.playLatest = function (list) {
-            const self = this;
-            const serverUrl = (
-                Lampa.Storage.get('torrserver_url') ||
-                Lampa.Storage.get('torrserver_url_two') || ''
-            ).replace(/\/+$/, '');
-
-            list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-            const latest = list[0];
-
-            this.log('Последний: ' + latest.title);
-            this.setStatus('Получаю плейлист...');
-
-            const m3uUrl = `${serverUrl}/stream/${encodeURIComponent(latest.title)}.m3u?link=${latest.hash}&m3u&fromlast`;
-            const network = new Lampa.Reguest();
-
-            network.native(
-                m3uUrl,
-                function (playlist) {
-                    if (typeof playlist !== 'string') playlist = JSON.stringify(playlist);
-                    const lines = playlist.split('\n').map(s => s.trim()).filter(Boolean);
-                    let streamUrl = null;
-
-                    for (let i = 0; i < lines.length; i++) {
-                        if (lines[i].startsWith('#EXTINF') && i + 1 < lines.length) {
-                            if (lines[i + 1].startsWith('http')) {
-                                streamUrl = lines[i + 1];
-                                break;
-                            }
-                        }
-                    }
-                    if (!streamUrl) streamUrl = lines.find(l => l.startsWith('http')) || null;
-                    if (!streamUrl) {
-                        self.log('Плейлист без ссылок: ' + playlist.substring(0, 200));
-                        return self.setError('Не удалось найти ссылку в плейлисте');
-                    }
-
-                    self.log('Запускаю плеер');
-                    Lampa.Player.play({ url: streamUrl, title: latest.title, hash: latest.hash });
-                    Lampa.Activity.backward();
-                },
-                function () { self.setError('Ошибка при получении плейлиста'); },
-                false,
-                { dataType: 'text' }
-            );
-        };
-
-        this.setStatus = function (msg) { html.find('.loading_status').text(msg).css('color', ''); };
-        this.setError  = function (msg) {
-            html.find('.loading_title').text('Ошибка');
-            html.find('.loading_status').text(msg).css('color', '#ff4e4e');
-        };
         this.log = function (msg) {
             const el = html.find('.loading_debug');
             el.html(el.html() + msg + '<br>');
@@ -206,7 +86,7 @@
                 </li>
             `);
             item.on('hover:enter', () => {
-                Lampa.Activity.push({ title: 'Загрузка...', component: 'test_plugin', page: 1 });
+                Lampa.Activity.push({ title: 'Диагностика', component: 'test_plugin', page: 1 });
             });
             $('.menu .menu__list').first().append(item);
         }

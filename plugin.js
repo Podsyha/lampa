@@ -9,9 +9,9 @@
             html.append(scroll.render());
             scroll.append($(`
                 <div class="about" style="padding:2rem">
-                    <h1 class="loading_title" style="font-size:1.2em">Перехват записи</h1>
-                    <p style="color:#aaa;font-size:.8em">Запусти серию через Lampa,<br>посмотри 1 мин, выйди назад,<br>снова открой этот экран</p>
-                    <div class="loading_debug" style="font-size:.75em;color:#ddd;margin-top:1rem;line-height:1.9;word-break:break-all"></div>
+                    <h1 class="loading_title">TorrServer</h1>
+                    <p class="loading_status">Ищу последний файл...</p>
+                    <div class="loading_debug" style="font-size:.75em;color:#aaa;margin-top:1.5rem;line-height:1.9;word-break:break-all"></div>
                 </div>
             `));
             return this.render();
@@ -19,51 +19,178 @@
 
         this.start = function () {
             const self = this;
+            const ts   = Lampa.Torserver;
 
-            // Перехватываем setItem чтобы поймать запись позиции в реальном времени
-            const origSetItem = localStorage.setItem.bind(localStorage);
-            localStorage.setItem = function(key, value) {
-                if (key.indexOf('file_view') >= 0 || key.indexOf('timeline') >= 0) {
-                    self.log('ЗАПИСЬ: ' + key);
-                    self.log('  ' + String(value).substring(0, 150));
-                }
-                return origSetItem(key, value);
-            };
+            ts.my(
+                function (list) {
+                    if (!list || !list.length) return self.setError('Список торрентов пуст');
 
-            self.log('Слушаю localStorage...');
-            self.log('Открой серию и выйди назад');
+                    list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+                    const latest = list[0];
+                    self.log('Торрент: ' + latest.title);
+                    self.setStatus('Загружаю плейлист...');
 
-            // Также показываем текущее состояние file_view на ТВ
-            self.log('─────────────────');
-            self.log('Текущий file_view:');
-            try {
-                Object.keys(localStorage)
-                    .filter(k => k.startsWith('file_view'))
-                    .forEach(function(key) {
-                        const fv = JSON.parse(localStorage.getItem(key) || '{}');
-                        const nonzero = Object.entries(fv).filter(([k,v]) => v.time > 0);
-                        self.log(key + ': ' + nonzero.length + ' записей с time>0');
-                        nonzero.slice(0,3).forEach(([k,v]) => {
-                            self.log('  [' + k + '] t=' + Math.round(v.time) + 's ' + v.percent + '%');
-                        });
-                    });
-            } catch(e) {
-                self.log('Ошибка: ' + e.message);
-            }
+                    const serverUrl = ts.url();
+
+                    // Запрашиваем ПОЛНЫЙ m3u без fromlast — он содержит все серии
+                    // fromlast используем только чтобы узнать с какой серии начать
+                    const fullM3u    = serverUrl + '/stream/' + encodeURIComponent(latest.title) + '.m3u?link=' + latest.hash + '&m3u';
+                    const lastM3u    = serverUrl + '/stream/' + encodeURIComponent(latest.title) + '.m3u?link=' + latest.hash + '&m3u&fromlast';
+
+                    const network = new Lampa.Reguest();
+
+                    // Сначала получаем полный список серий
+                    network.native(
+                        fullM3u,
+                        function (fullPlaylist) {
+                            if (typeof fullPlaylist !== 'string') fullPlaylist = String(fullPlaylist);
+
+                            const allItems = self.parseM3U(fullPlaylist);
+                            self.log('Всего серий: ' + allItems.length);
+
+                            if (!allItems.length) return self.setError('Плейлист пуст');
+
+                            // Получаем fromlast чтобы узнать какая серия последняя
+                            const network2 = new Lampa.Reguest();
+                            network2.native(
+                                lastM3u,
+                                function (lastPlaylist) {
+                                    if (typeof lastPlaylist !== 'string') lastPlaylist = String(lastPlaylist);
+
+                                    const lastItems = self.parseM3U(lastPlaylist);
+                                    const lastUrl   = lastItems.length ? lastItems[0].url : null;
+
+                                    self.log('Последняя серия URL: ' + (lastUrl ? lastUrl.substring(0, 60) + '...' : 'не найдена'));
+
+                                    // Находим индекс последней серии в полном списке
+                                    let startIndex = 0;
+                                    if (lastUrl) {
+                                        const idx = allItems.findIndex(item => item.url === lastUrl);
+                                        if (idx !== -1) startIndex = idx;
+                                    }
+
+                                    self.log('Старт с серии #' + (startIndex + 1) + ': ' + (allItems[startIndex] ? allItems[startIndex].title : '?'));
+
+                                    // Позиция внутри серии из Storage
+                                    const position = self.findPosition(latest.hash, allItems[startIndex]);
+                                    self.log('Позиция: ' + position + ' сек');
+
+                                    self.setStatus('Запускаю...');
+                                    self.launchPlayer(allItems, startIndex, latest, position);
+                                },
+                                function () {
+                                    // fromlast не сработал — стартуем с первой серии
+                                    self.log('fromlast не сработал, старт с начала');
+                                    self.launchPlayer(allItems, 0, latest, 0);
+                                },
+                                false,
+                                { dataType: 'text' }
+                            );
+                        },
+                        function () { self.setError('Ошибка загрузки плейлиста'); },
+                        false,
+                        { dataType: 'text' }
+                    );
+                },
+                function (err) { self.setError('Ошибка: ' + JSON.stringify(err)); }
+            );
 
             Lampa.Controller.add('content', {
                 toggle() {},
-                back() {
-                    // Восстанавливаем оригинальный setItem при выходе
-                    localStorage.setItem = origSetItem;
-                    Lampa.Activity.backward();
-                }
+                back() { Lampa.Activity.backward(); }
             });
             Lampa.Controller.toggle('content');
         };
 
+        // Парсим m3u — возвращаем массив {title, url}
+        this.parseM3U = function (text) {
+            const lines  = text.split('\n').map(s => s.trim()).filter(Boolean);
+            const result = [];
+            for (let i = 0; i < lines.length; i++) {
+                if (lines[i].startsWith('#EXTINF')) {
+                    const match = lines[i].match(/#EXTINF[^,]*,(.*)/);
+                    const title = match ? match[1].trim() : '';
+                    if (i + 1 < lines.length && lines[i + 1].startsWith('http')) {
+                        result.push({ title: title, url: lines[i + 1] });
+                        i++;
+                    }
+                }
+            }
+            // Фолбэк — просто все http строки
+            if (!result.length) {
+                lines.filter(l => l.startsWith('http')).forEach(url => result.push({ title: '', url }));
+            }
+            return result;
+        };
+
+        // Запускаем плеер с полным плейлистом
+        this.launchPlayer = function (items, startIndex, torrent, position) {
+            const startItem = items[startIndex];
+            if (!startItem) return this.setError('Не удалось определить серию');
+
+            // Формируем playlist в формате который понимает Lampa Player
+            // Lampa.Player принимает поле playlist как массив {url, title}
+            const playerData = {
+                url:        startItem.url,
+                title:      torrent.title,
+                hash:       torrent.hash,
+                playlist:   items.map(function (item, idx) {
+                    return {
+                        url:     item.url,
+                        title:   item.title || (torrent.title + ' — ' + (idx + 1)),
+                        active:  idx === startIndex
+                    };
+                }),
+                index:      startIndex,
+                timeline:   position ? { time: position * 1000, duration: 0 } : undefined,
+                start_from: position || undefined
+            };
+
+            this.log('Передаю в плеер ' + items.length + ' серий, старт с #' + (startIndex + 1));
+            Lampa.Player.play(playerData);
+        };
+
+        // Ищем сохранённую позицию в Lampa Storage / localStorage
+        this.findPosition = function (hash, item) {
+            // Пробуем по хэшу торрента
+            const keys = ['timeline_' + hash, 'time_' + hash, hash];
+            if (item && item.title) keys.unshift('timeline_' + item.title);
+
+            for (const key of keys) {
+                try {
+                    const val = Lampa.Storage.get(key);
+                    if (val) {
+                        const obj = typeof val === 'string' ? JSON.parse(val) : val;
+                        const t   = obj.time || obj.position || obj.current || 0;
+                        if (typeof t === 'number' && t > 10) {
+                            // Lampa хранит время в мс если > 1000, иначе в сек
+                            return t > 1000 ? Math.floor(t / 1000) : t;
+                        }
+                    }
+                } catch(e) {}
+            }
+
+            // Ищем в localStorage напрямую
+            try {
+                for (let i = 0; i < localStorage.length; i++) {
+                    const k = localStorage.key(i);
+                    if (k && k.includes(hash.substring(0, 8))) {
+                        this.log('localStorage key: ' + k + ' = ' + localStorage.getItem(k).substring(0, 80));
+                    }
+                }
+            } catch(e) {}
+
+            return 0;
+        };
+
+        this.setStatus = function (msg) { html.find('.loading_status').text(msg).css('color', ''); };
+        this.setError  = function (msg) {
+            html.find('.loading_title').text('Ошибка');
+            html.find('.loading_status').text(msg).css('color', '#ff4e4e');
+        };
         this.log = function (msg) {
-            html.find('.loading_debug').append($('<div>').text(msg));
+            const el = html.find('.loading_debug');
+            el.html(el.html() + msg + '<br>');
         };
         this.render  = () => html;
         this.destroy = function () { scroll.destroy(); html.remove(); };
@@ -71,6 +198,7 @@
 
     function startPlugin() {
         Lampa.Component.add('test_plugin', TestComponent);
+
         function addMenuItem() {
             if ($('.menu__item[data-type="test_plugin_button"]').length) return;
             const item = $(`
@@ -84,10 +212,11 @@
                 </li>
             `);
             item.on('hover:enter', () => {
-                Lampa.Activity.push({ title: 'Перехват', component: 'test_plugin', page: 1 });
+                Lampa.Activity.push({ title: 'Загрузка...', component: 'test_plugin', page: 1 });
             });
             $('.menu .menu__list').first().append(item);
         }
+
         if (window.appready) addMenuItem();
         else Lampa.Listener.follow('app', e => { if (e.type === 'ready') addMenuItem(); });
     }

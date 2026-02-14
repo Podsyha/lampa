@@ -27,68 +27,105 @@
 
                     list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
                     const latest = list[0];
-
                     self.log('Торрент: ' + latest.title);
-                    self.setStatus('Получаю плейлист...');
+                    self.setStatus('Получаю информацию о файлах...');
 
-                    // ts.url() возвращает правильный адрес сервера из настроек Lampa
-                    const serverUrl = ts.url();
-                    self.log('Server URL: ' + serverUrl);
+                    // Получаем файлы торрента — там хранится позиция последнего просмотра
+                    ts.files(
+                        latest.hash,
+                        function (data) {
+                            self.log('files() ответ: ' + JSON.stringify(data).substring(0, 400));
 
-                    // Строим m3u ссылку с &fromlast — TorrServer вернёт
-                    // последний просмотренный файл из этого торрента
-                    const m3uUrl = serverUrl
-                        + '/stream/' + encodeURIComponent(latest.title) + '.m3u'
-                        + '?link=' + latest.hash
-                        + '&m3u&fromlast';
+                            const files = data.file_stats || data.files || data || [];
+                            const arr   = Array.isArray(files) ? files : Object.values(files);
 
-                    self.log('M3U URL: ' + m3uUrl);
-                    self.setStatus('Разбираю плейлист...');
+                            // Ищем файл с непулевой позицией просмотра (last_stat)
+                            // TorrServer хранит позицию в file_stats[n].last_stat или .viewed_time
+                            const videoExts = /\.(mkv|mp4|avi|mov|ts|m2ts|wmv|flv|webm)$/i;
 
-                    // Загружаем m3u через Lampa.Reguest — он уже умеет работать с этим сервером
-                    const network = new Lampa.Reguest();
-                    network.native(
-                        m3uUrl,
-                        function (playlist) {
-                            if (typeof playlist !== 'string') playlist = String(playlist);
-                            self.log('Плейлист получен, строк: ' + playlist.split('\n').length);
+                            // Сортируем по last_stat — файл с последней активностью первый
+                            const videoFiles = arr.filter(f => videoExts.test(f.path || f.name || ''));
+                            if (!videoFiles.length && arr.length) videoFiles.push(...arr);
 
-                            const lines = playlist.split('\n').map(s => s.trim()).filter(Boolean);
-                            let streamUrl = null;
+                            // Ищем файл с позицией > 0
+                            let target = videoFiles.find(f => {
+                                const pos = (f.last_stat && f.last_stat.file_viewed)
+                                    || f.viewed_time
+                                    || f.position
+                                    || 0;
+                                return pos > 0;
+                            });
+                            // Если не нашли с позицией — берём первый видеофайл
+                            if (!target) target = videoFiles[0] || arr[0];
 
-                            // Ищем ссылку после #EXTINF
-                            for (let i = 0; i < lines.length; i++) {
-                                if (lines[i].startsWith('#EXTINF') && i + 1 < lines.length) {
-                                    if (lines[i + 1].startsWith('http')) {
-                                        streamUrl = lines[i + 1];
-                                        break;
+                            self.log('Файл: ' + JSON.stringify(target).substring(0, 200));
+
+                            if (!target) return self.setError('Нет файлов в торренте');
+
+                            // Извлекаем позицию из всех возможных полей
+                            const position = (target.last_stat && (
+                                    target.last_stat.file_viewed ||
+                                    target.last_stat.viewed ||
+                                    target.last_stat.position
+                                ))
+                                || target.viewed_time
+                                || target.position
+                                || 0;
+
+                            self.log('Позиция: ' + position + ' сек');
+
+                            const serverUrl = ts.url();
+                            const m3uUrl = serverUrl
+                                + '/stream/' + encodeURIComponent(latest.title) + '.m3u'
+                                + '?link=' + latest.hash
+                                + '&m3u&fromlast';
+
+                            self.setStatus('Загружаю плейлист...');
+
+                            const network = new Lampa.Reguest();
+                            network.native(
+                                m3uUrl,
+                                function (playlist) {
+                                    if (typeof playlist !== 'string') playlist = String(playlist);
+
+                                    const lines = playlist.split('\n').map(s => s.trim()).filter(Boolean);
+                                    let streamUrl = null;
+
+                                    for (let i = 0; i < lines.length; i++) {
+                                        if (lines[i].startsWith('#EXTINF') && i + 1 < lines.length) {
+                                            if (lines[i + 1].startsWith('http')) {
+                                                streamUrl = lines[i + 1];
+                                                break;
+                                            }
+                                        }
                                     }
-                                }
-                            }
-                            // Фолбэк — первая http строка
-                            if (!streamUrl) {
-                                streamUrl = lines.find(l => l.startsWith('http')) || null;
-                            }
+                                    if (!streamUrl) streamUrl = lines.find(l => l.startsWith('http')) || null;
+                                    if (!streamUrl) return self.setError('Ссылка в плейлисте не найдена');
 
-                            self.log('Stream URL: ' + (streamUrl || 'НЕ НАЙДЕН'));
-                            self.log('Жду 4 сек...');
+                                    self.log('Stream URL: ' + streamUrl.substring(0, 80) + '...');
+                                    self.log('Старт с позиции: ' + position + ' сек');
+                                    self.setStatus('Запускаю...');
 
-                            if (!streamUrl) return self.setError('Ссылка в плейлисте не найдена');
-
-                            setTimeout(function () {
-                                Lampa.Player.play({
-                                    url:   streamUrl,
-                                    title: latest.title,
-                                    hash:  latest.hash
-                                });
-                            }, 4000);
+                                    Lampa.Player.play({
+                                        url:      streamUrl,
+                                        title:    latest.title,
+                                        hash:     latest.hash,
+                                        // Позиция в миллисекундах — стандарт Lampa Player
+                                        timeline: position ? { time: position * 1000, duration: 0 } : undefined,
+                                        // Некоторые сборки Lampa используют start_from в секундах
+                                        start_from: position || undefined
+                                    });
+                                },
+                                function () { self.setError('Ошибка загрузки плейлиста'); },
+                                false,
+                                { dataType: 'text' }
+                            );
                         },
                         function (err) {
-                            self.log('Ошибка плейлиста: ' + JSON.stringify(err));
-                            self.setError('Не удалось загрузить плейлист');
-                        },
-                        false,
-                        { dataType: 'text' }
+                            self.log('files() ошибка: ' + JSON.stringify(err));
+                            // Фолбэк — запускаем без позиции
+                            self.launchWithoutPosition(latest);
+                        }
                     );
                 },
                 function (err) {
@@ -101,6 +138,30 @@
                 back() { Lampa.Activity.backward(); }
             });
             Lampa.Controller.toggle('content');
+        };
+
+        this.launchWithoutPosition = function (latest) {
+            const self = this;
+            const ts   = Lampa.Torserver;
+            const serverUrl = ts.url();
+            const m3uUrl = serverUrl
+                + '/stream/' + encodeURIComponent(latest.title) + '.m3u'
+                + '?link=' + latest.hash + '&m3u&fromlast';
+
+            const network = new Lampa.Reguest();
+            network.native(
+                m3uUrl,
+                function (playlist) {
+                    if (typeof playlist !== 'string') playlist = String(playlist);
+                    const lines = playlist.split('\n').map(s => s.trim()).filter(Boolean);
+                    let streamUrl = lines.find(l => l.startsWith('http')) || null;
+                    if (!streamUrl) return self.setError('Ссылка не найдена');
+                    Lampa.Player.play({ url: streamUrl, title: latest.title, hash: latest.hash });
+                },
+                function () { self.setError('Ошибка загрузки плейлиста'); },
+                false,
+                { dataType: 'text' }
+            );
         };
 
         this.setStatus = function (msg) { html.find('.loading_status').text(msg).css('color', ''); };

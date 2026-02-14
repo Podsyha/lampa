@@ -1,7 +1,6 @@
 (function () {
     'use strict';
 
-    // Lampa использует простой Java-style hashCode для ключей file_view
     function hashCode(str) {
         let hash = 0;
         for (let i = 0; i < str.length; i++) {
@@ -11,18 +10,40 @@
         return Math.abs(hash);
     }
 
-    // Получаем позицию из file_view по URL стрима
+    // Ищем позицию в file_view с учётом profile id
     function getPosition(url) {
         try {
-            const fileView = JSON.parse(localStorage.getItem('file_view') || '{}');
-            const key      = String(hashCode(url));
-            const entry    = fileView[key];
-            if (entry && entry.time > 0) {
-                // time хранится в секундах
-                return entry.time;
+            const urlHash = String(hashCode(url));
+
+            // Пробуем все варианты ключа file_view
+            const storageKeys = Object.keys(localStorage).filter(k => k.startsWith('file_view'));
+
+            for (const key of storageKeys) {
+                const fv    = JSON.parse(localStorage.getItem(key) || '{}');
+                const entry = fv[urlHash];
+                if (entry && entry.time > 0) return entry.time;
             }
         } catch(e) {}
         return 0;
+    }
+
+    // Выводим все file_view ключи и их содержимое для диагностики
+    function debugFileView(log) {
+        try {
+            const keys = Object.keys(localStorage).filter(k => k.startsWith('file_view'));
+            log('file_view ключи в storage: ' + (keys.join(', ') || 'не найдены'));
+            keys.forEach(function(key) {
+                const fv      = JSON.parse(localStorage.getItem(key) || '{}');
+                const entries = Object.entries(fv).filter(([k, v]) => v.time > 0);
+                if (entries.length) {
+                    entries.forEach(([k, v]) => log(key + '[' + k + '] time=' + v.time + ' dur=' + v.duration + ' %=' + v.percent));
+                } else {
+                    log(key + ': все time=0 (' + Object.keys(fv).length + ' записей)');
+                }
+            });
+        } catch(e) {
+            log('Ошибка чтения file_view: ' + e.message);
+        }
     }
 
     function TestComponent(object) {
@@ -45,6 +66,10 @@
             const self = this;
             const ts   = Lampa.Torserver;
 
+            // Сразу показываем состояние file_view
+            debugFileView(this.log.bind(this));
+            this.log('─────────────────');
+
             ts.my(
                 function (list) {
                     if (!list || !list.length) return self.setError('Список торрентов пуст');
@@ -59,78 +84,39 @@
                     const lastM3u   = serverUrl + '/stream/' + encodeURIComponent(latest.title) + '.m3u?link=' + latest.hash + '&m3u&fromlast';
 
                     const network = new Lampa.Reguest();
-
-                    // Загружаем полный плейлист
                     network.native(
                         fullM3u,
                         function (fullPlaylist) {
                             if (typeof fullPlaylist !== 'string') fullPlaylist = String(fullPlaylist);
-
                             const allItems = self.parseM3U(fullPlaylist);
-                            self.log('Всего серий: ' + allItems.length);
+                            self.log('Серий: ' + allItems.length);
                             if (!allItems.length) return self.setError('Плейлист пуст');
 
-                            // Загружаем fromlast — узнаём последний эпизод
                             const network2 = new Lampa.Reguest();
                             network2.native(
                                 lastM3u,
                                 function (lastPlaylist) {
                                     if (typeof lastPlaylist !== 'string') lastPlaylist = String(lastPlaylist);
-
                                     const lastItems = self.parseM3U(lastPlaylist);
                                     const lastUrl   = lastItems.length ? lastItems[0].url : null;
 
-                                    // Находим индекс последнего эпизода в полном списке
                                     let startIndex = 0;
                                     if (lastUrl) {
-                                        const idx = allItems.findIndex(item => item.url === lastUrl);
+                                        const idx = allItems.findIndex(i => i.url === lastUrl);
                                         if (idx !== -1) startIndex = idx;
                                     }
 
                                     const startItem = allItems[startIndex];
-                                    self.log('Серия #' + (startIndex + 1) + ': ' + startItem.title);
+                                    self.log('Эпизод #' + (startIndex + 1) + ': ' + startItem.title);
+                                    self.log('URL hash: ' + hashCode(startItem.url));
 
-                                    // Ищем позицию в file_view по URL эпизода
                                     const position = getPosition(startItem.url);
-                                    self.log('hash URL: ' + hashCode(startItem.url));
                                     self.log('Позиция: ' + position + ' сек');
 
-                                    // Показываем все ключи file_view для отладки
-                                    try {
-                                        const fv = JSON.parse(localStorage.getItem('file_view') || '{}');
-                                        self.log('file_view ключи: ' + Object.keys(fv).join(', '));
-                                        // Вычисляем хэши для всех серий — ищем совпадение
-                                        allItems.forEach(function(item, i) {
-                                            const h = String(hashCode(item.url));
-                                            if (fv[h] && fv[h].time > 0) {
-                                                self.log('Найдена позиция для серии #' + (i+1) + ': ' + fv[h].time + ' сек, ' + fv[h].percent + '%');
-                                            }
-                                        });
-                                    } catch(e) {}
-
                                     self.setStatus('Запускаю...');
-
-                                    Lampa.Player.play({
-                                        url:      startItem.url,
-                                        title:    latest.title,
-                                        hash:     latest.hash,
-                                        playlist: allItems.map(function(item, idx) {
-                                            return {
-                                                url:    item.url,
-                                                title:  item.title || (latest.title + ' — ' + (idx + 1)),
-                                                active: idx === startIndex
-                                            };
-                                        }),
-                                        index:      startIndex,
-                                        // Передаём позицию — Lampa Player подхватит её
-                                        timeline:   position ? { time: position, duration: 0 } : undefined,
-                                        start_from: position || undefined
-                                    });
+                                    self.launchPlayer(allItems, startIndex, latest, position);
                                 },
-                                function () {
-                                    self.log('fromlast не сработал');
-                                    self.launchPlayer(allItems, 0, latest, 0);
-                                },
+                                function () { self.launchPlayer(allItems, 0, latest, 0); },
                                 false,
                                 { dataType: 'text' }
                             );
@@ -150,6 +136,27 @@
             Lampa.Controller.toggle('content');
         };
 
+        this.launchPlayer = function (items, startIndex, torrent, position) {
+            const startItem = items[startIndex];
+            if (!startItem) return this.setError('Серия не найдена');
+
+            Lampa.Player.play({
+                url:        startItem.url,
+                title:      torrent.title,
+                hash:       torrent.hash,
+                playlist:   items.map(function(item, idx) {
+                    return {
+                        url:    item.url,
+                        title:  item.title || (torrent.title + ' — ' + (idx + 1)),
+                        active: idx === startIndex
+                    };
+                }),
+                index:      startIndex,
+                timeline:   position ? { time: position, duration: 0 } : undefined,
+                start_from: position || undefined
+            });
+        };
+
         this.parseM3U = function (text) {
             const lines  = text.split('\n').map(s => s.trim()).filter(Boolean);
             const result = [];
@@ -167,22 +174,6 @@
                 lines.filter(l => l.startsWith('http')).forEach(url => result.push({ title: '', url }));
             }
             return result;
-        };
-
-        this.launchPlayer = function (items, startIndex, torrent, position) {
-            const startItem = items[startIndex];
-            if (!startItem) return this.setError('Серия не найдена');
-            Lampa.Player.play({
-                url:        startItem.url,
-                title:      torrent.title,
-                hash:       torrent.hash,
-                playlist:   items.map(function(item, idx) {
-                    return { url: item.url, title: item.title, active: idx === startIndex };
-                }),
-                index:      startIndex,
-                timeline:   position ? { time: position, duration: 0 } : undefined,
-                start_from: position || undefined
-            });
         };
 
         this.setStatus = function (msg) { html.find('.loading_status').text(msg).css('color', ''); };

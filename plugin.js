@@ -1,6 +1,15 @@
 (function () {
     'use strict';
 
+    function hashCode(str) {
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+            hash = ((hash << 5) - hash) + str.charCodeAt(i);
+            hash |= 0;
+        }
+        return Math.abs(hash);
+    }
+
     function TestComponent(object) {
         const scroll = new Lampa.Scroll({ mask: true, over: true });
         const html   = $('<div></div>');
@@ -9,8 +18,8 @@
             html.append(scroll.render());
             scroll.append($(`
                 <div class="about" style="padding:2rem">
-                    <h1 class="loading_title" style="font-size:1.4em">Storage с позицией</h1>
-                    <div class="loading_debug" style="font-size:.8em;color:#ddd;margin-top:1rem;line-height:2"></div>
+                    <h1 class="loading_title" style="font-size:1.2em">Поиск хэша URL</h1>
+                    <div class="loading_debug" style="font-size:.78em;color:#ddd;margin-top:1rem;line-height:1.9"></div>
                 </div>
             `));
             return this.render();
@@ -18,38 +27,66 @@
 
         this.start = function () {
             const self = this;
-            let found  = 0;
+            const ts   = Lampa.Torserver;
 
-            try {
-                // Только ключи с ненулевым time
-                for (let i = 0; i < localStorage.length; i++) {
-                    const k = localStorage.key(i);
-                    const v = localStorage.getItem(k) || '';
-                    // Ищем любое "time": где значение не 0
-                    if (/"time"\s*:\s*[1-9]/.test(v)) {
-                        self.log('<b style="color:#8af">' + k + '</b>');
-                        // Парсим и показываем только time/percent/duration
-                        try {
-                            const obj = JSON.parse(v);
-                            // Если это объект объектов (file_view)
-                            if (typeof obj === 'object') {
-                                Object.entries(obj).forEach(([id, val]) => {
-                                    if (val && val.time > 0) {
-                                        self.log('  [' + id + '] t=' + val.time + 's ' + (val.percent||0) + '%');
-                                        found++;
-                                    }
-                                });
+            // Известные хэши из file_view с ТВ
+            const knownHashes = [
+                '49463088','66208688','68319923','79119831',
+                '109972911','166718282','198177767','208617741'
+            ];
+
+            ts.my(function (list) {
+                if (!list || !list.length) return self.log('Нет торрентов');
+
+                list.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+                const latest    = list[0];
+                const serverUrl = ts.url();
+                const fullM3u   = serverUrl + '/stream/' + encodeURIComponent(latest.title) + '.m3u?link=' + latest.hash + '&m3u';
+
+                const network = new Lampa.Reguest();
+                network.native(fullM3u, function (fp) {
+                    if (typeof fp !== 'string') fp = String(fp);
+
+                    const lines = fp.split('\n').map(s => s.trim()).filter(Boolean);
+                    const urls  = lines.filter(l => l.startsWith('http'));
+
+                    self.log('URLs в плейлисте: ' + urls.length);
+
+                    // Для каждого URL пробуем разные варианты хэширования
+                    let matched = false;
+                    urls.forEach(function(url, i) {
+                        // Вариант 1: полный URL
+                        const h1 = String(hashCode(url));
+                        // Вариант 2: URL без &play и &index параметров
+                        const urlClean = url.replace(/&play/g, '').replace(/&index=\d+/g, '');
+                        const h2 = String(hashCode(urlClean));
+                        // Вариант 3: только до первого &
+                        const urlBase = url.split('&')[0];
+                        const h3 = String(hashCode(urlBase));
+                        // Вариант 4: только путь без query
+                        const urlPath = url.split('?')[0];
+                        const h4 = String(hashCode(urlPath));
+
+                        [h1, h2, h3, h4].forEach(function(h, vi) {
+                            if (knownHashes.includes(h)) {
+                                matched = true;
+                                self.log('✓ СОВПАДЕНИЕ! Серия #' + (i+1));
+                                self.log('  Вариант ' + (vi+1) + ', hash=' + h);
+                                self.log('  ' + url.substring(0, 80));
                             }
-                        } catch(e) {
-                            self.log('  ' + v.substring(0, 80));
-                            found++;
-                        }
+                        });
+                    });
+
+                    if (!matched) {
+                        self.log('Прямых совпадений нет.');
+                        self.log('Пробую первые 3 URL:');
+                        urls.slice(0, 3).forEach(function(url, i) {
+                            self.log('#' + (i+1) + ' h=' + hashCode(url));
+                            self.log(url.substring(0, 70));
+                        });
                     }
-                }
-                if (!found) self.log('Ничего не найдено.\nПосмотри серию через Lampa\nи зайди снова.');
-            } catch(e) {
-                self.log('Ошибка: ' + e.message);
-            }
+                }, function() { self.log('Ошибка плейлиста'); }, false, { dataType: 'text' });
+            }, function() { self.log('Ошибка торрентов'); });
 
             Lampa.Controller.add('content', {
                 toggle() {},
@@ -59,7 +96,7 @@
         };
 
         this.log = function (msg) {
-            html.find('.loading_debug').append($('<div>').html(msg));
+            html.find('.loading_debug').append($('<div>').text(msg));
         };
         this.render  = () => html;
         this.destroy = function () { scroll.destroy(); html.remove(); };
@@ -80,7 +117,7 @@
                 </li>
             `);
             item.on('hover:enter', () => {
-                Lampa.Activity.push({ title: 'Storage', component: 'test_plugin', page: 1 });
+                Lampa.Activity.push({ title: 'Хэш', component: 'test_plugin', page: 1 });
             });
             $('.menu .menu__list').first().append(item);
         }
